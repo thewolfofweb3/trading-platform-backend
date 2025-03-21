@@ -29,7 +29,43 @@ app.get('/api/candles', async (req, res) => {
             headers: { Authorization: `Bearer ${OANDA_API_KEY}` },
             params: { granularity: 'M5', count: 50 }
         });
-        res.json(response.data.candles);
+
+        const prices = response.data.candles.map(candle => ({
+            time: new Date(candle.time),
+            close: parseFloat(candle.mid.c),
+            high: parseFloat(candle.mid.h),
+            low: parseFloat(candle.mid.l),
+            volume: parseInt(candle.volume)
+        }));
+
+        // Calculate session highs and lows (9:45 AM - 3:30 PM ET)
+        const sessionStartHour = 9;
+        const sessionStartMinute = 45;
+        const sessionEndHour = 15;
+        const sessionEndMinute = 30;
+        const sessionCandles = prices.filter(candle => {
+            const hours = candle.time.getUTCHours() - 4; // Convert UTC to ET
+            const minutes = candle.time.getUTCMinutes();
+            return (hours > sessionStartHour || (hours === sessionStartHour && minutes >= sessionStartMinute)) &&
+                   (hours < sessionEndHour || (hours === sessionEndHour && minutes <= sessionEndMinute));
+        });
+
+        const sessionHigh = sessionCandles.length > 0 ? Math.max(...sessionCandles.map(c => c.high)) : null;
+        const sessionLow = sessionCandles.length > 0 ? Math.min(...sessionCandles.map(c => c.low)) : null;
+
+        // Calculate Fibonacci levels (based on session high and low)
+        const fibLevels = sessionHigh && sessionLow ? {
+            high: sessionHigh,
+            low: sessionLow,
+            fib_0: sessionHigh,
+            fib_236: sessionHigh - (sessionHigh - sessionLow) * 0.236,
+            fib_382: sessionHigh - (sessionHigh - sessionLow) * 0.382,
+            fib_500: sessionHigh - (sessionHigh - sessionLow) * 0.500,
+            fib_618: sessionHigh - (sessionHigh - sessionLow) * 0.618,
+            fib_100: sessionLow,
+        } : null;
+
+        res.json({ candles: response.data.candles, sessionHigh, sessionLow, fibLevels });
     } catch (error) {
         res.status(500).json({ error: 'Error fetching candles', details: error.message });
     }
@@ -77,6 +113,33 @@ app.post('/api/start-trading', async (req, res) => {
         const latestVolume = latestPrice.volume;
         const latestATR = atr14[atr14.length - 1];
 
+        // Calculate session highs and lows (9:45 AM - 3:30 PM ET)
+        const sessionStartHour = 9;
+        const sessionStartMinute = 45;
+        const sessionEndHour = 15;
+        const sessionEndMinute = 30;
+        const sessionCandles = prices.filter(candle => {
+            const hours = candle.time.getUTCHours() - 4; // Convert UTC to ET
+            const minutes = candle.time.getUTCMinutes();
+            return (hours > sessionStartHour || (hours === sessionStartHour && minutes >= sessionStartMinute)) &&
+                   (hours < sessionEndHour || (hours === sessionEndHour && minutes <= sessionEndMinute));
+        });
+
+        const sessionHigh = sessionCandles.length > 0 ? Math.max(...sessionCandles.map(c => c.high)) : null;
+        const sessionLow = sessionCandles.length > 0 ? Math.min(...sessionCandles.map(c => c.low)) : null;
+
+        // Calculate Fibonacci levels (based on session high and low)
+        const fibLevels = sessionHigh && sessionLow ? {
+            high: sessionHigh,
+            low: sessionLow,
+            fib_0: sessionHigh,
+            fib_236: sessionHigh - (sessionHigh - sessionLow) * 0.236,
+            fib_382: sessionHigh - (sessionHigh - sessionLow) * 0.382,
+            fib_500: sessionHigh - (sessionHigh - sessionLow) * 0.500,
+            fib_618: sessionHigh - (sessionHigh - sessionLow) * 0.618,
+            fib_100: sessionLow,
+        } : null;
+
         // Check time window (9:45 AM - 11:30 AM ET and 1:30 PM - 3:30 PM ET)
         const hours = latestPrice.time.getUTCHours() - 4; // Convert UTC to ET
         const minutes = latestPrice.time.getUTCMinutes();
@@ -109,21 +172,31 @@ app.post('/api/start-trading', async (req, res) => {
             }
         }
 
-        // Strategy logic (tightened for higher win rate)
+        // Strategy logic (tightened for higher win rate, with Fibonacci and session levels)
         let tradeSignal = null;
+
+        // Check if price is near Fibonacci levels or session levels for confluence
+        const isNearFibOrSession = fibLevels && (
+            Math.abs(latestPrice.close - fibLevels.fib_236) < latestATR ||
+            Math.abs(latestPrice.close - fibLevels.fib_382) < latestATR ||
+            Math.abs(latestPrice.close - fibLevels.fib_500) < latestATR ||
+            Math.abs(latestPrice.close - fibLevels.fib_618) < latestATR ||
+            (sessionHigh && Math.abs(latestPrice.close - sessionHigh) < latestATR) ||
+            (sessionLow && Math.abs(latestPrice.close - sessionLow) < latestATR)
+        );
 
         // 1. Opening Range Breakout (9:45 AM)
         if (hours === 9 && minutes === 45) {
             const rangeCandles = prices.slice(0, 3); // First 15 minutes (9:30-9:45)
             const rangeHigh = Math.max(...rangeCandles.map(c => c.high));
-            if (latestPrice.close > rangeHigh && latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isDiscount) {
+            if (latestPrice.close > rangeHigh && latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isDiscount && isNearFibOrSession) {
                 tradeSignal = 'buy';
             }
         }
 
         // 2. Breakout Pullback
         if (!tradeSignal && previousPrice.close < previousEMA && latestPrice.close > latestEMA && latestVolume > volumeAvg * 1.5) {
-            if (latestPrice.high > previousPrice.high && latestPrice.close < latestPrice.high && latestRSI > 70 && isDiscount) {
+            if (latestPrice.high > previousPrice.high && latestPrice.close < latestPrice.high && latestRSI > 70 && isDiscount && isNearFibOrSession) {
                 if (fvg || breakerBlock) {
                     tradeSignal = 'buy';
                 }
@@ -131,19 +204,19 @@ app.post('/api/start-trading', async (req, res) => {
         }
 
         // 3. VWAP Bounce (using EMA as a proxy)
-        if (!tradeSignal && Math.abs(latestPrice.close - latestEMA) < 0.5 && latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isDiscount) {
+        if (!tradeSignal && Math.abs(latestPrice.close - latestEMA) < 0.5 && latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isDiscount && isNearFibOrSession) {
             tradeSignal = 'buy';
         }
 
         // 4. Mean Reversion
-        if (!tradeSignal && latestRSI < 20 && latestVolume > volumeAvg * 2.0 && isDiscount) {
+        if (!tradeSignal && latestRSI < 20 && latestVolume > volumeAvg * 2.0 && isDiscount && isNearFibOrSession) {
             if (fvg || breakerBlock) {
                 tradeSignal = 'buy';
             }
         }
 
         // 5. Order Block Break
-        if (!tradeSignal && breakerBlock && isDiscount && latestRSI > 70) {
+        if (!tradeSignal && breakerBlock && isDiscount && latestRSI > 70 && isNearFibOrSession) {
             tradeSignal = 'buy';
         }
 
