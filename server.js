@@ -18,6 +18,11 @@ const dailyLossCap = 4500; // 3% of 150K
 const riskPerTrade = 900; // 0.6% of 150K
 let tradesToday = 0;
 
+// Default route for root URL
+app.get('/', (req, res) => {
+    res.json({ message: 'Welcome to the Trading Platform Backend' });
+});
+
 app.get('/api/status', (req, res) => {
     res.json({ status: 'Backend is running', dailyLoss, tradesToday });
 });
@@ -35,7 +40,8 @@ app.get('/api/candles', async (req, res) => {
             close: parseFloat(candle.mid.c),
             high: parseFloat(candle.mid.h),
             low: parseFloat(candle.mid.l),
-            volume: parseInt(candle.volume)
+            volume: parseInt(candle.volume),
+            isBullish: parseFloat(candle.mid.c) > parseFloat(candle.mid.o)
         }));
 
         // Calculate session highs and lows (9:45 AM - 3:30 PM ET)
@@ -92,7 +98,8 @@ app.post('/api/start-trading', async (req, res) => {
             close: parseFloat(candle.mid.c),
             high: parseFloat(candle.mid.h),
             low: parseFloat(candle.mid.l),
-            volume: parseInt(candle.volume)
+            volume: parseInt(candle.volume),
+            isBullish: parseFloat(candle.mid.c) > parseFloat(candle.mid.o)
         }));
 
         // Calculate indicators
