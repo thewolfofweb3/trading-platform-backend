@@ -109,21 +109,21 @@ app.post('/api/start-trading', async (req, res) => {
             }
         }
 
-        // Strategy logic
+        // Strategy logic (tightened for higher win rate)
         let tradeSignal = null;
 
         // 1. Opening Range Breakout (9:45 AM)
         if (hours === 9 && minutes === 45) {
             const rangeCandles = prices.slice(0, 3); // First 15 minutes (9:30-9:45)
             const rangeHigh = Math.max(...rangeCandles.map(c => c.high));
-            if (latestPrice.close > rangeHigh && latestRSI > 50 && latestVolume > volumeAvg * 1.2 && isDiscount) {
+            if (latestPrice.close > rangeHigh && latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isDiscount) {
                 tradeSignal = 'buy';
             }
         }
 
         // 2. Breakout Pullback
-        if (!tradeSignal && previousPrice.close < previousEMA && latestPrice.close > latestEMA && latestVolume > volumeAvg * 1.3) {
-            if (latestPrice.high > previousPrice.high && latestPrice.close < latestPrice.high && latestRSI > 60 && isDiscount) {
+        if (!tradeSignal && previousPrice.close < previousEMA && latestPrice.close > latestEMA && latestVolume > volumeAvg * 1.5) {
+            if (latestPrice.high > previousPrice.high && latestPrice.close < latestPrice.high && latestRSI > 70 && isDiscount) {
                 if (fvg || breakerBlock) {
                     tradeSignal = 'buy';
                 }
@@ -131,19 +131,19 @@ app.post('/api/start-trading', async (req, res) => {
         }
 
         // 3. VWAP Bounce (using EMA as a proxy)
-        if (!tradeSignal && Math.abs(latestPrice.close - latestEMA) < 1 && latestRSI > 50 && latestVolume > volumeAvg * 1.2 && isDiscount) {
+        if (!tradeSignal && Math.abs(latestPrice.close - latestEMA) < 0.5 && latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isDiscount) {
             tradeSignal = 'buy';
         }
 
         // 4. Mean Reversion
-        if (!tradeSignal && latestRSI < 25 && latestVolume > volumeAvg * 1.5 && isDiscount) {
+        if (!tradeSignal && latestRSI < 20 && latestVolume > volumeAvg * 2.0 && isDiscount) {
             if (fvg || breakerBlock) {
                 tradeSignal = 'buy';
             }
         }
 
         // 5. Order Block Break
-        if (!tradeSignal && breakerBlock && isDiscount) {
+        if (!tradeSignal && breakerBlock && isDiscount && latestRSI > 70) {
             tradeSignal = 'buy';
         }
 
@@ -155,7 +155,7 @@ app.post('/api/start-trading', async (req, res) => {
                 instrument: 'NAS100_USD',
                 type: 'MARKET',
                 positionFill: 'DEFAULT',
-                takeProfitOnFill: { price: (latestPrice.close + 8).toString() }, // 8 ticks
+                takeProfitOnFill: { price: (latestPrice.close + 4).toString() }, // 4 ticks (1:1 R:R)
                 stopLossOnFill: { price: (latestPrice.close - 4).toString() } // 4 ticks
             };
             const response = await axios.post(`${OANDA_API_URL}/v3/accounts/${OANDA_ACCOUNT_ID}/orders`, { order }, {
