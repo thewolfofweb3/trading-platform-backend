@@ -22,6 +22,19 @@ app.get('/api/status', (req, res) => {
     res.json({ status: 'Backend is running', dailyLoss, tradesToday });
 });
 
+app.get('/api/candles', async (req, res) => {
+    try {
+        const instrument = 'NAS100_USD';
+        const response = await axios.get(`${OANDA_API_URL}/v3/instruments/${instrument}/candles`, {
+            headers: { Authorization: `Bearer ${OANDA_API_KEY}` },
+            params: { granularity: 'M5', count: 50 }
+        });
+        res.json(response.data.candles);
+    } catch (error) {
+        res.status(500).json({ error: 'Error fetching candles', details: error.message });
+    }
+});
+
 app.post('/api/start-trading', async (req, res) => {
     try {
         // Reset daily stats at the start of the day (simplified)
