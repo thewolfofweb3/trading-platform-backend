@@ -8,9 +8,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const OANDA_API_KEY = process.env.OANDA_API_KEY;
-const OANDA_ACCOUNT_ID = process.env.OANDA_ACCOUNT_ID;
-const OANDA_API_URL = 'https://api-fxtrade.oanda.com';
+const ALPACA_API_KEY = process.env.ALPACA_API_KEY;
+const ALPACA_SECRET_KEY = process.env.ALPACA_SECRET_KEY;
+const ALPACA_API_URL = 'https://paper-api.alpaca.markets'; // Paper trading URL
 
 // Trading state
 let dailyLoss = 0;
@@ -27,55 +27,33 @@ app.get('/api/status', (req, res) => {
     res.json({ status: 'Backend is running', dailyLoss, tradesToday });
 });
 
-app.get('/api/candles', async (req, res) => {
+// Helper function to fetch candlestick data from Alpaca
+async function fetchCandlestickData() {
     try {
-        const instrument = 'NAS100_USD';
-        const response = await axios.get(`${OANDA_API_URL}/v3/instruments/${instrument}/candles`, {
-            headers: { Authorization: `Bearer ${OANDA_API_KEY}` },
-            params: { granularity: 'M5', count: 50 }
+        const response = await axios.get(`${ALPACA_API_URL}/v2/stocks/QQQ/bars`, {
+            headers: {
+                'APCA-API-KEY-ID': ALPACA_API_KEY,
+                'APCA-API-SECRET-KEY': ALPACA_SECRET_KEY,
+            },
+            params: {
+                timeframe: '5Min',
+                limit: 50,
+            },
         });
 
-        const prices = response.data.candles.map(candle => ({
-            time: new Date(candle.time),
-            close: parseFloat(candle.mid.c),
-            high: parseFloat(candle.mid.h),
-            low: parseFloat(candle.mid.l),
-            volume: parseInt(candle.volume),
-            isBullish: parseFloat(candle.mid.c) > parseFloat(candle.mid.o)
+        const bars = response.data.bars;
+        return bars.map(bar => ({
+            time: new Date(bar.t),
+            close: bar.c,
+            high: bar.h,
+            low: bar.l,
+            volume: bar.v,
+            isBullish: bar.c > bar.o,
         }));
-
-        // Calculate session highs and lows (9:45 AM - 3:30 PM ET)
-        const sessionStartHour = 9;
-        const sessionStartMinute = 45;
-        const sessionEndHour = 15;
-        const sessionEndMinute = 30;
-        const sessionCandles = prices.filter(candle => {
-            const hours = candle.time.getUTCHours() - 4; // Convert UTC to ET
-            const minutes = candle.time.getUTCMinutes();
-            return (hours > sessionStartHour || (hours === sessionStartHour && minutes >= sessionStartMinute)) &&
-                   (hours < sessionEndHour || (hours === sessionEndHour && minutes <= sessionEndMinute));
-        });
-
-        const sessionHigh = sessionCandles.length > 0 ? Math.max(...sessionCandles.map(c => c.high)) : null;
-        const sessionLow = sessionCandles.length > 0 ? Math.min(...sessionCandles.map(c => c.low)) : null;
-
-        // Calculate Fibonacci levels (based on session high and low)
-        const fibLevels = sessionHigh && sessionLow ? {
-            high: sessionHigh,
-            low: sessionLow,
-            fib_0: sessionHigh,
-            fib_236: sessionHigh - (sessionHigh - sessionLow) * 0.236,
-            fib_382: sessionHigh - (sessionHigh - sessionLow) * 0.382,
-            fib_500: sessionHigh - (sessionHigh - sessionLow) * 0.500,
-            fib_618: sessionHigh - (sessionHigh - sessionLow) * 0.618,
-            fib_100: sessionLow,
-        } : null;
-
-        res.json({ candles: response.data.candles, sessionHigh, sessionLow, fibLevels });
     } catch (error) {
-        res.status(500).json({ error: 'Error fetching candles', details: error.message });
+        throw new Error(`Error fetching candles: ${error.message}`);
     }
-});
+}
 
 app.post('/api/start-trading', async (req, res) => {
     try {
@@ -86,21 +64,8 @@ app.post('/api/start-trading', async (req, res) => {
             tradesToday = 0;
         }
 
-        // Fetch 5-minute candlestick data for MNQ
-        const instrument = 'NAS100_USD';
-        const candles = await axios.get(`${OANDA_API_URL}/v3/instruments/${instrument}/candles`, {
-            headers: { Authorization: `Bearer ${OANDA_API_KEY}` },
-            params: { granularity: 'M5', count: 50 }
-        });
-
-        const prices = candles.data.candles.map(candle => ({
-            time: new Date(candle.time),
-            close: parseFloat(candle.mid.c),
-            high: parseFloat(candle.mid.h),
-            low: parseFloat(candle.mid.l),
-            volume: parseInt(candle.volume),
-            isBullish: parseFloat(candle.mid.c) > parseFloat(candle.mid.o)
-        }));
+        // Fetch 5-minute candlestick data for QQQ
+        const prices = await fetchCandlestickData();
 
         // Calculate indicators
         const closes = prices.map(p => p.close);
@@ -231,18 +196,26 @@ app.post('/api/start-trading', async (req, res) => {
         if (tradeSignal === 'buy') {
             const units = Math.floor(riskPerTrade / 2); // $2 stop loss per unit
             const order = {
-                units: units, // 450 units
-                instrument: 'NAS100_USD',
-                type: 'MARKET',
-                positionFill: 'DEFAULT',
-                takeProfitOnFill: { price: (latestPrice.close + 4).toString() }, // 4 ticks (1:1 R:R)
-                stopLossOnFill: { price: (latestPrice.close - 4).toString() } // 4 ticks
+                symbol: 'QQQ',
+                qty: units, // Alpaca uses qty for shares
+                side: 'buy',
+                type: 'market',
+                time_in_force: 'gtc',
+                take_profit: {
+                    limit_price: (latestPrice.close + 4).toString(), // 4 ticks (1:1 R:R)
+                },
+                stop_loss: {
+                    stop_price: (latestPrice.close - 4).toString(), // 4 ticks
+                },
             };
-            const response = await axios.post(`${OANDA_API_URL}/v3/accounts/${OANDA_ACCOUNT_ID}/orders`, { order }, {
-                headers: { Authorization: `Bearer ${OANDA_API_KEY}` }
+            const response = await axios.post(`${ALPACA_API_URL}/v2/orders`, order, {
+                headers: {
+                    'APCA-API-KEY-ID': ALPACA_API_KEY,
+                    'APCA-API-SECRET-KEY': ALPACA_SECRET_KEY,
+                },
             });
             tradesToday++;
-            res.json({ message: 'Trade executed', signal: tradeSignal, units, tradeId: response.data.orderCreateTransaction.id });
+            res.json({ message: 'Trade executed', signal: tradeSignal, units, tradeId: response.data.id });
         } else {
             res.json({ message: 'No trade signal' });
         }
