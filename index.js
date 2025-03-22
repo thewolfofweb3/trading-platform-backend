@@ -8,7 +8,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
+const POLYGON_API_KEY = process.env.POLYGON_API_KEY || 'YOUR_API_KEY'; // Replace with your Polygon.io API key
 const POLYGON_API_URL = 'https://api.polygon.io';
 
 // Trading state
@@ -27,33 +27,46 @@ app.get('/api/status', (req, res) => {
 });
 
 // Determine MNQ/MES contract symbol
-function getContractSymbol(instrument, date) {
-    const year = date.getFullYear();
-    const month = date.getMonth() + 1;
-    const contractMonth = month <= 3 ? 'H' : month <= 6 ? 'M' : month <= 9 ? 'U' : 'Z';
-    return `I:${instrument}${contractMonth}${year.toString().slice(-2)}`;
+function getFrontMonthContract(instrument, date) {
+    const month = date.getMonth() + 1; // 1-12
+    const year = date.getFullYear() % 100; // Last two digits
+    if (month <= 3) return `I:${instrument}H${year}`; // March
+    if (month <= 6) return `I:${instrument}M${year}`; // June
+    if (month <= 9) return `I:${instrument}U${year}`; // September
+    return `I:${instrument}Z${year}`; // December
 }
 
 // Fetch candlestick data
 async function fetchCandlestickData(instrument, startDate) {
+    const ticker = getFrontMonthContract(instrument, startDate);
     const endDate = new Date(startDate);
     endDate.setDate(endDate.getDate() + 1);
     const startDateStr = startDate.toISOString().split('T')[0];
     const endDateStr = endDate.toISOString().split('T')[0];
-    const response = await axios.get(
-        `${POLYGON_API_URL}/v2/aggs/ticker/${instrument}/range/5/minute/${startDateStr}/${endDateStr}`,
-        { params: { apiKey: POLYGON_API_KEY } }
-    );
-    const candles = response.data.results.map(candle => ({
-        time: new Date(candle.t),
-        open: candle.o,
-        high: candle.h,
-        low: candle.l,
-        close: candle.c,
-        volume: candle.v,
-        isBullish: candle.c > candle.o,
-    }));
-    return candles;
+    console.log(`Fetching data for ${ticker} from ${startDateStr} to ${endDateStr}`);
+    try {
+        const response = await axios.get(
+            `${POLYGON_API_URL}/v2/aggs/ticker/${ticker}/range/5/minute/${startDateStr}/${endDateStr}`,
+            { params: { apiKey: POLYGON_API_KEY } }
+        );
+        if (!response.data.results) {
+            throw new Error('No results returned from Polygon.io');
+        }
+        const candles = response.data.results.map(candle => ({
+            time: new Date(candle.t),
+            open: candle.o,
+            high: candle.h,
+            low: candle.l,
+            close: candle.c,
+            volume: candle.v,
+            isBullish: candle.c > candle.o,
+        }));
+        console.log(`Fetched ${candles.length} candles for ${ticker}`);
+        return candles;
+    } catch (error) {
+        console.error('Error fetching candles:', error.message);
+        throw error;
+    }
 }
 
 // Strategy Implementations
@@ -92,16 +105,18 @@ function bollingerSqueezeStrategy(candles) {
     const bb = BollingerBands.calculate({ period: 20, stdDev: 2, values: closes });
     const signals = [];
     for (let i = 1; i < closes.length; i++) {
-        if (bb[i - 1].upper - bb[i - 1].lower < bb[i - 2].upper - bb[i - 2].lower && closes[i] > bb[i].upper) {
-            signals.push({ time: candles[i].time, signal: 'buy' });
-        } else if (bb[i - 1].upper - bb[i - 1].lower < bb[i - 2].upper - bb[i - 2].lower && closes[i] < bb[i].lower) {
-            signals.push({ time: candles[i].time, signal: 'sell' });
+        if (bb[i - 1] && bb[i - 2] && bb[i]) {
+            const bandwidth = (bb[i - 1].upper - bb[i - 1].lower) / bb[i - 1].middle;
+            const prevBandwidth = (bb[i - 2].upper - bb[i - 2].lower) / bb[i - 2].middle;
+            if (bandwidth < 0.1 && closes[i] > bb[i].upper) {
+                signals.push({ time: candles[i].time, signal: 'buy' });
+            } else if (bandwidth < 0.1 && closes[i] < bb[i].lower) {
+                signals.push({ time: candles[i].time, signal: 'sell' });
+            }
         }
     }
     return signals;
 }
-
-// Add RSI Divergence and MACD Histogram similarly...
 
 // Simulate trades with risk management
 function simulateTrades(candles, signals) {
@@ -114,9 +129,10 @@ function simulateTrades(candles, signals) {
         if (signal && dailyLoss < dailyLossCap) {
             if (signal.signal === 'buy' && !position) {
                 position = { entry: candles[i].close, stopLoss: candles[i].close - atr, takeProfit: candles[i].close + atr * 3, time: candles[i].time };
+                trades.push({ timestamp: candles[i].time, signal: 'buy', entryPrice: candles[i].close, units: 1, stopLoss: position.stopLoss, takeProfit: position.takeProfit, profitLoss: 0 });
             } else if (signal.signal === 'sell' && position) {
-                const profitLoss = position.entry - candles[i].close;
-                trades.push({ ...position, exit: candles[i].close, profitLoss });
+                const profitLoss = (candles[i].close - position.entry) * position.units;
+                trades.push({ timestamp: candles[i].time, signal: 'sell', entryPrice: position.entry, units: position.units, stopLoss: position.stopLoss, takeProfit: position.takeProfit, profitLoss: profitLoss });
                 dailyLoss += profitLoss < 0 ? -profitLoss : 0;
                 position = null;
             }
@@ -124,8 +140,8 @@ function simulateTrades(candles, signals) {
         if (position && i > 0) {
             const currPrice = candles[i].close;
             if (currPrice <= position.stopLoss || currPrice >= position.takeProfit) {
-                const profitLoss = position.entry - currPrice;
-                trades.push({ ...position, exit: currPrice, profitLoss });
+                const profitLoss = (currPrice - position.entry) * position.units;
+                trades.push({ timestamp: candles[i].time, signal: 'exit', entryPrice: position.entry, units: position.units, stopLoss: position.stopLoss, takeProfit: position.takeProfit, profitLoss: profitLoss });
                 dailyLoss += profitLoss < 0 ? -profitLoss : 0;
                 position = null;
             } else if (currPrice - position.entry > atr) {
@@ -136,22 +152,70 @@ function simulateTrades(candles, signals) {
     return trades;
 }
 
+app.get('/api/candles', async (req, res) => {
+    try {
+        const startDateStr = req.query.startDate || new Date(Date.now() - 50 * 5 * 60 * 1000).toISOString().split('T')[0];
+        const instrument = req.query.instrument || 'MNQ';
+        const startDate = new Date(startDateStr);
+        const candles = await fetchCandlestickData(instrument, startDate);
+        res.json({ candles });
+    } catch (error) {
+        res.status(500).json({ error: 'Error fetching candles', details: error.message });
+    }
+});
+
 app.post('/api/backtest', async (req, res) => {
-    const { instrument, startDate, strategy } = req.body;
-    if (!instrument || !startDate || !strategy) {
-        return res.status(400).json({ error: 'Instrument, start date, and strategy required' });
+    try {
+        const { instrument, startDate, strategy } = req.body;
+        if (!instrument || !startDate || !strategy) {
+            return res.status(400).json({ error: 'Instrument, start date, and strategy required' });
+        }
+        const candles = await fetchCandlestickData(instrument, new Date(startDate));
+        if (!candles || candles.length === 0) {
+            return res.status(404).json({ error: 'No data available for the selected period' });
+        }
+
+        const startDateTime = new Date(startDate);
+        startDateTime.setUTCHours(13, 45, 0, 0); // 9:45 AM ET
+        const endDateTime = new Date(startDate);
+        endDateTime.setUTCHours(23, 59, 59, 999); // End of day
+        const filteredCandles = candles.filter(candle => candle.time >= startDateTime && candle.time <= endDateTime);
+        console.log(`After date filtering: ${filteredCandles.length} candles`);
+
+        if (filteredCandles.length === 0) {
+            return res.status(404).json({ error: 'No data available for the selected date after filtering' });
+        }
+
+        const sessionCandles = filteredCandles.filter(candle => {
+            const hours = candle.time.getUTCHours() - 4;
+            const minutes = candle.time.getUTCMinutes();
+            return (hours === 9 && minutes >= 45) || (hours === 10) || (hours === 11 && minutes <= 30) ||
+                   (hours === 13 && minutes >= 30) || (hours === 14) || (hours === 15 && minutes <= 30);
+        });
+        console.log(`After trading window filtering: ${sessionCandles.length} candles`);
+
+        if (sessionCandles.length === 0) {
+            return res.status(404).json({ error: 'No data available within the trading window' });
+        }
+
+        let signals;
+        switch (strategy) {
+            case 'ictScalping': signals = ictScalpingStrategy(sessionCandles); break;
+            case 'maCrossover': signals = maCrossoverStrategy(sessionCandles); break;
+            case 'bollingerSqueeze': signals = bollingerSqueezeStrategy(sessionCandles); break;
+            default: return res.status(400).json({ error: 'Invalid strategy' });
+        }
+
+        const trades = simulateTrades(sessionCandles, signals);
+        res.json({
+            totalTrades: trades.length,
+            netProfit: trades.reduce((sum, trade) => sum + trade.profitLoss, 0),
+            trades: trades,
+        });
+    } catch (error) {
+        console.error('Backtesting error:', error.message);
+        res.status(500).json({ error: 'Backtesting error', details: error.message });
     }
-    const contractSymbol = getContractSymbol(instrument, new Date(startDate));
-    const candles = await fetchCandlestickData(contractSymbol, new Date(startDate));
-    let signals;
-    switch (strategy) {
-        case 'ictScalping': signals = ictScalpingStrategy(candles); break;
-        case 'maCrossover': signals = maCrossoverStrategy(candles); break;
-        case 'bollingerSqueeze': signals = bollingerSqueezeStrategy(candles); break;
-        default: return res.status(400).json({ error: 'Invalid strategy' });
-    }
-    const trades = simulateTrades(candles, signals);
-    res.json({ trades });
 });
 
 const PORT = process.env.PORT || 5000;
