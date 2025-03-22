@@ -27,11 +27,11 @@ app.get('/api/status', (req, res) => {
     res.json({ status: 'Backend is running', dailyLoss, tradesToday });
 });
 
-// Function to determine the correct MNQ contract based on the date
-function getMNQContractSymbol(date) {
+// Function to determine the correct MNQ or MES contract based on the date and instrument
+function getContractSymbol(instrument, date) {
     const year = date.getFullYear();
     const month = date.getMonth() + 1; // 1-12
-    // MNQ contracts expire in March (H), June (M), September (U), December (Z)
+    // MNQ and MES contracts expire in March (H), June (M), September (U), December (Z)
     let contractMonth, contractYear;
     if (month <= 3) {
         contractMonth = 'H'; // March
@@ -46,11 +46,11 @@ function getMNQContractSymbol(date) {
         contractMonth = 'Z'; // December
         contractYear = year;
     }
-    const contractSymbol = `I:MNQ${contractMonth}${contractYear.toString().slice(-2)}`;
+    const contractSymbol = `I:${instrument}${contractMonth}${contractYear.toString().slice(-2)}`;
     return contractSymbol;
 }
 
-// Fetch candlestick data from Polygon.io for MNQ
+// Fetch candlestick data from Polygon.io for MNQ or MES
 async function fetchCandlestickData(instrument, startDate) {
     try {
         const endDate = new Date(startDate);
@@ -89,7 +89,7 @@ app.get('/api/candles', async (req, res) => {
     try {
         const startDateStr = req.query.startDate || new Date(Date.now() - 50 * 5 * 60 * 1000).toISOString().split('T')[0];
         const startDate = new Date(startDateStr);
-        const contractSymbol = getMNQContractSymbol(startDate);
+        const contractSymbol = getContractSymbol('MNQ', startDate);
         const candles = await fetchCandlestickData(contractSymbol, startDate);
 
         // Calculate session highs and lows (9:45 AM - 3:30 PM ET)
@@ -128,13 +128,14 @@ app.get('/api/candles', async (req, res) => {
 app.post('/api/backtest', async (req, res) => {
     try {
         const instrument = req.query.instrument || 'I:MNQH25'; // Default to March 2025 contract
+        const baseInstrument = instrument.includes('MNQ') ? 'MNQ' : 'MES';
         const startDateStr = req.query.startDate;
         if (!startDateStr) {
             return res.status(400).json({ error: 'Start date is required' });
         }
 
         const startDate = new Date(startDateStr);
-        const contractSymbol = getMNQContractSymbol(startDate);
+        const contractSymbol = getContractSymbol(baseInstrument, startDate);
 
         // Fetch historical data
         const candles = await fetchCandlestickData(contractSymbol, startDate);
@@ -148,11 +149,26 @@ app.post('/api/backtest', async (req, res) => {
         const endDateTime = new Date(startDate);
         endDateTime.setUTCHours(23, 59, 59, 999); // End of the selected day
         const filteredCandles = candles.filter(candle => candle.time >= startDateTime && candle.time <= endDateTime);
+        console.log(`After date filtering: ${filteredCandles.length} candles`);
+
         if (filteredCandles.length === 0) {
-            return res.status(404).json({ error: 'No data available for the selected date' });
+            return res.status(404).json({ error: 'No data available for the selected date after filtering' });
         }
 
-        console.log(`Processing ${filteredCandles.length} candles for backtest on ${startDateStr}`);
+        // Apply trading window filter (9:45 AM - 11:30 AM ET and 1:30 PM - 3:30 PM ET)
+        const sessionCandles = filteredCandles.filter(candle => {
+            const hours = candle.time.getUTCHours() - 4;
+            const minutes = candle.time.getUTCMinutes();
+            return (hours === 9 && minutes >= 45) || (hours === 10) || (hours === 11 && minutes <= 30) ||
+                   (hours === 13 && minutes >= 30) || (hours === 14) || (hours === 15 && minutes <= 30);
+        });
+        console.log(`After trading window filtering: ${sessionCandles.length} candles`);
+
+        if (sessionCandles.length === 0) {
+            return res.status(404).json({ error: 'No data available within the trading window on the selected date' });
+        }
+
+        console.log(`Processing ${sessionCandles.length} candles for backtest on ${startDateStr}`);
 
         // Backtest state
         let trades = [];
@@ -163,8 +179,8 @@ app.post('/api/backtest', async (req, res) => {
         let lastDay = null;
 
         // Process each candle sequentially
-        for (let i = 50; i < filteredCandles.length; i++) { // Start after enough candles for support/resistance (50 lookback)
-            const candle = filteredCandles[i];
+        for (let i = 0; i < sessionCandles.length; i++) { // Simplified to start from the beginning
+            const candle = sessionCandles[i];
             const currentDay = candle.time.toISOString().split('T')[0];
 
             // Reset daily stats at the start of a new day
@@ -174,22 +190,13 @@ app.post('/api/backtest', async (req, res) => {
             }
             lastDay = currentDay;
 
-            // Skip if outside trading window (9:45 AM - 11:30 AM ET and 1:30 PM - 3:30 PM ET)
-            const hours = candle.time.getUTCHours() - 4;
-            const minutes = candle.time.getUTCMinutes();
-            const isTradingWindow = (hours === 9 && minutes >= 45) || (hours === 10) || (hours === 11 && minutes <= 30) ||
-                                   (hours === 13 && minutes >= 30) || (hours === 14) || (hours === 15 && minutes <= 30);
-            if (!isTradingWindow || dailyLoss >= dailyLossCap) {
-                continue;
-            }
-
             // Check daily trade limit
             if (tradesToday >= 5) {
                 // Only allow golden trades after 5 trades
                 let isGoldenTrade = false;
 
                 // Use candles up to the current index for indicators (no look-ahead)
-                const prices = filteredCandles.slice(0, i + 1);
+                const prices = sessionCandles.slice(0, i + 1);
                 const closes = prices.map(p => p.close);
                 const highs = prices.map(p => p.high);
                 const lows = prices.map(p => p.low);
@@ -265,13 +272,13 @@ app.post('/api/backtest', async (req, res) => {
                 const bigMoveIndexDown = prices.slice(0, -1).findIndex((p, j) => Math.abs(p.close - prices[j + 1].close) > 50 && p.close > prices[j + 1].close);
                 if (bigMoveIndexUp !== -1) {
                     const orderBlockHigh = prices[bigMoveIndexUp].high;
-                    if (latestPrice.high > orderBlockHigh && latestPrice.close < orderBlockHigh && latestVolume > volumeAvg * 1.2) {
+                    if (latestPrice.high > orderBlockHigh && latestPrice.close < orderBlockHigh && latestVolume > volumeAvg * 1.1) {
                         breakerBlockBullish = true;
                     }
                 }
                 if (bigMoveIndexDown !== -1) {
                     const orderBlockLow = prices[bigMoveIndexDown].low;
-                    if (latestPrice.low < orderBlockLow && latestPrice.close > orderBlockLow && latestVolume > volumeAvg * 1.2) {
+                    if (latestPrice.low < orderBlockLow && latestPrice.close > orderBlockLow && latestVolume > volumeAvg * 1.1) {
                         breakerBlockBearish = true;
                     }
                 }
@@ -299,7 +306,7 @@ app.post('/api/backtest', async (req, res) => {
             }
 
             // Use candles up to the current index for indicators (no look-ahead)
-            const prices = filteredCandles.slice(0, i + 1);
+            const prices = sessionCandles.slice(0, i + 1);
             const closes = prices.map(p => p.close);
             const highs = prices.map(p => p.high);
             const lows = prices.map(p => p.low);
@@ -489,7 +496,7 @@ app.post('/api/backtest', async (req, res) => {
                 }
 
                 // Calculate number of contracts based on risk
-                const riskPerContract = stopLossDistance * 2; // $2 per point for MNQ
+                const riskPerContract = stopLossDistance * 2; // $2 per point for MNQ/MES
                 let units = Math.floor(riskPerTrade / riskPerContract);
                 units = Math.min(units, 35); // Cap at 35 contracts
 
@@ -505,8 +512,8 @@ app.post('/api/backtest', async (req, res) => {
                 let lowestLow = tradeSignal === 'sell' ? entryPrice : null;
                 let breakEvenSet = false;
 
-                for (let j = i + 1; j < filteredCandles.length; j++) {
-                    const futureCandle = filteredCandles[j];
+                for (let j = i + 1; j < sessionCandles.length; j++) {
+                    const futureCandle = sessionCandles[j];
 
                     // Update highest high/lowest low for trailing stop
                     if (tradeSignal === 'buy') {
@@ -562,7 +569,7 @@ app.post('/api/backtest', async (req, res) => {
                 }
 
                 if (!tradeClosed) {
-                    const lastCandle = filteredCandles[filteredCandles.length - 1];
+                    const lastCandle = sessionCandles[sessionCandles.length - 1];
                     const priceDiff = tradeSignal === 'buy' ? (lastCandle.close - entryPrice) : (entryPrice - lastCandle.close);
                     profitLoss = priceDiff * units * 2;
                     profitLoss = tradeSignal === 'buy' ?
