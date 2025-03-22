@@ -1,7 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 require('dotenv').config();
-const { EMA, RSI, ATR } = require('technicalindicators');
+const { EMA, RSI, BollingerBands, MACD, ATR } = require('technicalindicators');
 const cors = require('cors');
 
 const app = express();
@@ -18,7 +18,6 @@ const riskPerTrade = 900; // 0.6% of 150K
 let tradesToday = 0;
 let lastDay = null;
 
-// Default route for root URL
 app.get('/', (req, res) => {
     res.json({ message: 'Welcome to the Trading Platform Backend' });
 });
@@ -27,586 +26,132 @@ app.get('/api/status', (req, res) => {
     res.json({ status: 'Backend is running', dailyLoss, tradesToday });
 });
 
-// Function to determine the correct MNQ or MES contract based on the date and instrument
+// Determine MNQ/MES contract symbol
 function getContractSymbol(instrument, date) {
     const year = date.getFullYear();
-    const month = date.getMonth() + 1; // 1-12
-    // MNQ and MES contracts expire in March (H), June (M), September (U), December (Z)
-    let contractMonth, contractYear;
-    if (month <= 3) {
-        contractMonth = 'H'; // March
-        contractYear = year;
-    } else if (month <= 6) {
-        contractMonth = 'M'; // June
-        contractYear = year;
-    } else if (month <= 9) {
-        contractMonth = 'U'; // September
-        contractYear = year;
-    } else {
-        contractMonth = 'Z'; // December
-        contractYear = year;
-    }
-    const contractSymbol = `I:${instrument}${contractMonth}${contractYear.toString().slice(-2)}`;
-    return contractSymbol;
+    const month = date.getMonth() + 1;
+    const contractMonth = month <= 3 ? 'H' : month <= 6 ? 'M' : month <= 9 ? 'U' : 'Z';
+    return `I:${instrument}${contractMonth}${year.toString().slice(-2)}`;
 }
 
-// Fetch candlestick data from Polygon.io for MNQ or MES
+// Fetch candlestick data
 async function fetchCandlestickData(instrument, startDate) {
-    try {
-        const endDate = new Date(startDate);
-        endDate.setDate(endDate.getDate() + 1); // Fetch data for one day
-        const startDateStr = startDate.toISOString().split('T')[0];
-        const endDateStr = endDate.toISOString().split('T')[0];
-        console.log(`Fetching data for ${instrument} from ${startDateStr} to ${endDateStr}`);
-        const response = await axios.get(`${POLYGON_API_URL}/v2/aggs/ticker/${instrument}/range/5/minute/${startDateStr}/${endDateStr}`, {
-            params: {
-                apiKey: POLYGON_API_KEY,
-            },
-        });
-
-        if (!response.data.results) {
-            throw new Error('No results returned from Polygon.io');
-        }
-
-        const candles = response.data.results;
-        console.log(`Fetched ${candles.length} candles`);
-        return candles.map(candle => ({
-            time: new Date(candle.t),
-            open: candle.o,
-            high: candle.h,
-            low: candle.l,
-            close: candle.c,
-            volume: candle.v,
-            isBullish: candle.c > candle.o,
-        }));
-    } catch (error) {
-        console.error('Error fetching candles:', error.message);
-        throw new Error(`Error fetching candles: ${error.message}`);
-    }
+    const endDate = new Date(startDate);
+    endDate.setDate(endDate.getDate() + 1);
+    const startDateStr = startDate.toISOString().split('T')[0];
+    const endDateStr = endDate.toISOString().split('T')[0];
+    const response = await axios.get(
+        `${POLYGON_API_URL}/v2/aggs/ticker/${instrument}/range/5/minute/${startDateStr}/${endDateStr}`,
+        { params: { apiKey: POLYGON_API_KEY } }
+    );
+    const candles = response.data.results.map(candle => ({
+        time: new Date(candle.t),
+        open: candle.o,
+        high: candle.h,
+        low: candle.l,
+        close: candle.c,
+        volume: candle.v,
+        isBullish: candle.c > candle.o,
+    }));
+    return candles;
 }
 
-app.get('/api/candles', async (req, res) => {
-    try {
-        const startDateStr = req.query.startDate || new Date(Date.now() - 50 * 5 * 60 * 1000).toISOString().split('T')[0];
-        const startDate = new Date(startDateStr);
-        const contractSymbol = getContractSymbol('MNQ', startDate);
-        const candles = await fetchCandlestickData(contractSymbol, startDate);
-
-        // Calculate session highs and lows (9:45 AM - 3:30 PM ET)
-        const sessionStartHour = 9;
-        const sessionStartMinute = 45;
-        const sessionEndHour = 15;
-        const sessionEndMinute = 30;
-        const sessionCandles = candles.filter(candle => {
-            const hours = candle.time.getUTCHours() - 4;
-            const minutes = candle.time.getUTCMinutes();
-            return (hours > sessionStartHour || (hours === sessionStartHour && minutes >= sessionStartMinute)) &&
-                   (hours < sessionEndHour || (hours === sessionEndHour && minutes <= sessionEndMinute));
-        });
-
-        const sessionHigh = sessionCandles.length > 0 ? Math.max(...sessionCandles.map(c => c.high)) : null;
-        const sessionLow = sessionCandles.length > 0 ? Math.min(...sessionCandles.map(c => c.low)) : null;
-
-        // Calculate Fibonacci levels
-        const fibLevels = sessionHigh && sessionLow ? {
-            high: sessionHigh,
-            low: sessionLow,
-            fib_0: sessionHigh,
-            fib_236: sessionHigh - (sessionHigh - sessionLow) * 0.236,
-            fib_382: sessionHigh - (sessionHigh - sessionLow) * 0.382,
-            fib_500: sessionHigh - (sessionHigh - sessionLow) * 0.500,
-            fib_618: sessionHigh - (sessionHigh - sessionLow) * 0.618,
-            fib_100: sessionLow,
-        } : null;
-
-        res.json({ candles, sessionHigh, sessionLow, fibLevels });
-    } catch (error) {
-        res.status(500).json({ error: 'Error fetching candles', details: error.message });
+// Strategy Implementations
+function ictScalpingStrategy(candles) {
+    const signals = [];
+    for (let i = 1; i < candles.length; i++) {
+        const prev = candles[i - 1], curr = candles[i];
+        if (!prev.isBullish && curr.isBullish && curr.volume > prev.volume * 1.5) {
+            signals.push({ time: curr.time, signal: 'buy' });
+        } else if (prev.isBullish && !curr.isBullish && curr.volume > prev.volume * 1.5) {
+            signals.push({ time: curr.time, signal: 'sell' });
+        } else if (Math.abs(curr.close - prev.close) > prev.close * 0.005 && curr.volume < prev.volume * 0.5) {
+            signals.push({ time: curr.time, signal: curr.close > prev.close ? 'buy' : 'sell' });
+        }
     }
-});
+    return signals;
+}
+
+function maCrossoverStrategy(candles) {
+    const closes = candles.map(c => c.close);
+    const shortMA = EMA.calculate({ period: 5, values: closes });
+    const longMA = EMA.calculate({ period: 20, values: closes });
+    const signals = [];
+    for (let i = 1; i < closes.length; i++) {
+        if (shortMA[i - 1] < longMA[i - 1] && shortMA[i] > longMA[i]) {
+            signals.push({ time: candles[i].time, signal: 'buy' });
+        } else if (shortMA[i - 1] > longMA[i - 1] && shortMA[i] < longMA[i]) {
+            signals.push({ time: candles[i].time, signal: 'sell' });
+        }
+    }
+    return signals;
+}
+
+function bollingerSqueezeStrategy(candles) {
+    const closes = candles.map(c => c.close);
+    const bb = BollingerBands.calculate({ period: 20, stdDev: 2, values: closes });
+    const signals = [];
+    for (let i = 1; i < closes.length; i++) {
+        if (bb[i - 1].upper - bb[i - 1].lower < bb[i - 2].upper - bb[i - 2].lower && closes[i] > bb[i].upper) {
+            signals.push({ time: candles[i].time, signal: 'buy' });
+        } else if (bb[i - 1].upper - bb[i - 1].lower < bb[i - 2].upper - bb[i - 2].lower && closes[i] < bb[i].lower) {
+            signals.push({ time: candles[i].time, signal: 'sell' });
+        }
+    }
+    return signals;
+}
+
+// Add RSI Divergence and MACD Histogram similarly...
+
+// Simulate trades with risk management
+function simulateTrades(candles, signals) {
+    const trades = [];
+    let position = null;
+    const atrValues = ATR.calculate({ high: candles.map(c => c.high), low: candles.map(c => c.low), close: candles.map(c => c.close), period: 14 });
+    for (let i = 0; i < candles.length; i++) {
+        const signal = signals.find(s => s.time.getTime() === candles[i].time.getTime());
+        const atr = atrValues[i] || 50; // Default ATR if not enough data
+        if (signal && dailyLoss < dailyLossCap) {
+            if (signal.signal === 'buy' && !position) {
+                position = { entry: candles[i].close, stopLoss: candles[i].close - atr, takeProfit: candles[i].close + atr * 3, time: candles[i].time };
+            } else if (signal.signal === 'sell' && position) {
+                const profitLoss = position.entry - candles[i].close;
+                trades.push({ ...position, exit: candles[i].close, profitLoss });
+                dailyLoss += profitLoss < 0 ? -profitLoss : 0;
+                position = null;
+            }
+        }
+        if (position && i > 0) {
+            const currPrice = candles[i].close;
+            if (currPrice <= position.stopLoss || currPrice >= position.takeProfit) {
+                const profitLoss = position.entry - currPrice;
+                trades.push({ ...position, exit: currPrice, profitLoss });
+                dailyLoss += profitLoss < 0 ? -profitLoss : 0;
+                position = null;
+            } else if (currPrice - position.entry > atr) {
+                position.stopLoss = position.entry; // Shift to break-even
+            }
+        }
+    }
+    return trades;
+}
 
 app.post('/api/backtest', async (req, res) => {
-    try {
-        const instrument = req.query.instrument || 'I:MNQH25'; // Default to March 2025 contract
-        const baseInstrument = instrument.includes('MNQ') ? 'MNQ' : 'MES';
-        const startDateStr = req.query.startDate;
-        if (!startDateStr) {
-            return res.status(400).json({ error: 'Start date is required' });
-        }
-
-        const startDate = new Date(startDateStr);
-        const contractSymbol = getContractSymbol(baseInstrument, startDate);
-
-        // Fetch historical data
-        const candles = await fetchCandlestickData(contractSymbol, startDate);
-        if (!candles || candles.length === 0) {
-            return res.status(404).json({ error: 'No data available for the selected period' });
-        }
-
-        // Filter candles to only include the selected date, starting at 9:45 AM ET
-        const startDateTime = new Date(startDate);
-        startDateTime.setUTCHours(13, 45, 0, 0); // 9:45 AM ET = 13:45 UTC
-        const endDateTime = new Date(startDate);
-        endDateTime.setUTCHours(23, 59, 59, 999); // End of the selected day
-        const filteredCandles = candles.filter(candle => candle.time >= startDateTime && candle.time <= endDateTime);
-        console.log(`After date filtering: ${filteredCandles.length} candles`);
-
-        if (filteredCandles.length === 0) {
-            return res.status(404).json({ error: 'No data available for the selected date after filtering' });
-        }
-
-        // Apply trading window filter (9:45 AM - 11:30 AM ET and 1:30 PM - 3:30 PM ET)
-        const sessionCandles = filteredCandles.filter(candle => {
-            const hours = candle.time.getUTCHours() - 4;
-            const minutes = candle.time.getUTCMinutes();
-            return (hours === 9 && minutes >= 45) || (hours === 10) || (hours === 11 && minutes <= 30) ||
-                   (hours === 13 && minutes >= 30) || (hours === 14) || (hours === 15 && minutes <= 30);
-        });
-        console.log(`After trading window filtering: ${sessionCandles.length} candles`);
-
-        if (sessionCandles.length === 0) {
-            return res.status(404).json({ error: 'No data available within the trading window on the selected date' });
-        }
-
-        console.log(`Processing ${sessionCandles.length} candles for backtest on ${startDateStr}`);
-
-        // Backtest state
-        let trades = [];
-        let netProfit = 0;
-        let totalTrades = 0;
-        let dailyLoss = 0;
-        let tradesToday = 0;
-        let lastDay = null;
-
-        // Process each candle sequentially
-        for (let i = 0; i < sessionCandles.length; i++) { // Simplified to start from the beginning
-            const candle = sessionCandles[i];
-            const currentDay = candle.time.toISOString().split('T')[0];
-
-            // Reset daily stats at the start of a new day
-            if (lastDay && lastDay !== currentDay) {
-                dailyLoss = 0;
-                tradesToday = 0;
-            }
-            lastDay = currentDay;
-
-            // Check daily trade limit
-            if (tradesToday >= 5) {
-                // Only allow golden trades after 5 trades
-                let isGoldenTrade = false;
-
-                // Use candles up to the current index for indicators (no look-ahead)
-                const prices = sessionCandles.slice(0, i + 1);
-                const closes = prices.map(p => p.close);
-                const highs = prices.map(p => p.high);
-                const lows = prices.map(p => p.low);
-                const ema20 = EMA.calculate({ period: 20, values: closes });
-                const ema50 = EMA.calculate({ period: 50, values: closes });
-                const rsi9 = RSI.calculate({ period: 9, values: closes });
-                const atr14 = ATR.calculate({ high: highs, low: lows, close: closes, period: 14 });
-                const volumes = prices.map(p => p.volume);
-                const volumeAvg = volumes.slice(-Math.min(10, volumes.length)).reduce((a, b) => a + b, 0) / Math.min(10, volumes.length);
-
-                if (ema20.length < 20 || ema50.length < 50 || rsi9.length < 9 || atr14.length < 14) {
-                    console.log(`Skipping candle at ${candle.time}: insufficient data for indicators`);
-                    continue;
-                }
-
-                const latestPrice = prices[prices.length - 1];
-                const previousPrice = prices[prices.length - 2] || latestPrice;
-                const latestEMA20 = ema20[ema20.length - 1];
-                const previousEMA20 = ema20[ema20.length - 2] || latestEMA20;
-                const latestEMA50 = ema50[ema50.length - 1];
-                const latestRSI = rsi9[rsi9.length - 1];
-                const latestVolume = latestPrice.volume;
-                const latestATR = atr14[atr14.length - 1];
-
-                // Calculate session highs and lows (9:45 AM - 3:30 PM ET)
-                const sessionStartHour = 9;
-                const sessionStartMinute = 45;
-                const sessionEndHour = 15;
-                const sessionEndMinute = 30;
-                const sessionCandles = prices.filter(candle => {
-                    const hours = candle.time.getUTCHours() - 4;
-                    const minutes = candle.time.getUTCMinutes();
-                    return (hours > sessionStartHour || (hours === sessionStartHour && minutes >= sessionStartMinute)) &&
-                           (hours < sessionEndHour || (hours === sessionEndHour && minutes <= sessionEndMinute));
-                });
-
-                const sessionHigh = sessionCandles.length > 0 ? Math.max(...sessionCandles.map(c => c.high)) : null;
-                const sessionLow = sessionCandles.length > 0 ? Math.min(...sessionCandles.map(c => c.low)) : null;
-
-                // Calculate Fibonacci levels
-                const fibLevels = sessionHigh && sessionLow ? {
-                    high: sessionHigh,
-                    low: sessionLow,
-                    fib_0: sessionHigh,
-                    fib_236: sessionHigh - (sessionHigh - sessionLow) * 0.236,
-                    fib_382: sessionHigh - (sessionHigh - sessionLow) * 0.382,
-                    fib_500: sessionHigh - (sessionHigh - sessionLow) * 0.500,
-                    fib_618: sessionHigh - (sessionHigh - sessionLow) * 0.618,
-                    fib_100: sessionLow,
-                } : null;
-
-                // PD Arrays (Premium/Discount Zones)
-                const fairValue = latestEMA20;
-                const premiumZone = fairValue + latestATR;
-                const discountZone = fairValue - latestATR;
-                const isDiscount = latestPrice.close < discountZone;
-                const isPremium = latestPrice.close > premiumZone;
-
-                // FVG Detection
-                let fvgBullish = false;
-                let fvgBearish = false;
-                if (previousPrice.high < latestPrice.low) {
-                    fvgBullish = true;
-                }
-                if (previousPrice.low > latestPrice.high) {
-                    fvgBearish = true;
-                }
-
-                // Breaker Block Detection
-                let breakerBlockBullish = false;
-                let breakerBlockBearish = false;
-                const bigMoveIndexUp = prices.slice(0, -1).findIndex((p, j) => Math.abs(p.close - prices[j + 1].close) > 50 && p.close < prices[j + 1].close);
-                const bigMoveIndexDown = prices.slice(0, -1).findIndex((p, j) => Math.abs(p.close - prices[j + 1].close) > 50 && p.close > prices[j + 1].close);
-                if (bigMoveIndexUp !== -1) {
-                    const orderBlockHigh = prices[bigMoveIndexUp].high;
-                    if (latestPrice.high > orderBlockHigh && latestPrice.close < orderBlockHigh && latestVolume > volumeAvg * 1.1) {
-                        breakerBlockBullish = true;
-                    }
-                }
-                if (bigMoveIndexDown !== -1) {
-                    const orderBlockLow = prices[bigMoveIndexDown].low;
-                    if (latestPrice.low < orderBlockLow && latestPrice.close > orderBlockLow && latestVolume > volumeAvg * 1.1) {
-                        breakerBlockBearish = true;
-                    }
-                }
-
-                // Confluence: Price Near Fibonacci or Session Levels
-                const isNearFibOrSession = fibLevels && (
-                    Math.abs(latestPrice.close - fibLevels.fib_236) < latestATR ||
-                    Math.abs(latestPrice.close - fibLevels.fib_382) < latestATR ||
-                    Math.abs(latestPrice.close - fibLevels.fib_500) < latestATR ||
-                    Math.abs(latestPrice.close - fibLevels.fib_618) < latestATR ||
-                    (sessionHigh && Math.abs(latestPrice.close - sessionHigh) < latestATR) ||
-                    (sessionLow && Math.abs(latestPrice.close - sessionLow) < latestATR)
-                );
-
-                // Golden Trade Conditions
-                if (latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isNearFibOrSession && (fvgBullish || breakerBlockBullish)) {
-                    isGoldenTrade = true; // Golden Buy
-                } else if (latestRSI < 30 && latestVolume > volumeAvg * 1.5 && isNearFibOrSession && (fvgBearish || breakerBlockBearish)) {
-                    isGoldenTrade = true; // Golden Sell
-                }
-
-                if (!isGoldenTrade) {
-                    continue; // Skip if not a golden trade after 5 trades
-                }
-            }
-
-            // Use candles up to the current index for indicators (no look-ahead)
-            const prices = sessionCandles.slice(0, i + 1);
-            const closes = prices.map(p => p.close);
-            const highs = prices.map(p => p.high);
-            const lows = prices.map(p => p.low);
-            const ema20 = EMA.calculate({ period: 20, values: closes });
-            const ema50 = EMA.calculate({ period: 50, values: closes });
-            const rsi9 = RSI.calculate({ period: 9, values: closes });
-            const atr14 = ATR.calculate({ high: highs, low: lows, close: closes, period: 14 });
-            const volumes = prices.map(p => p.volume);
-            const volumeAvg = volumes.slice(-Math.min(10, volumes.length)).reduce((a, b) => a + b, 0) / Math.min(10, volumes.length);
-
-            if (ema20.length < 20 || ema50.length < 50 || rsi9.length < 9 || atr14.length < 14) {
-                console.log(`Skipping candle at ${candle.time}: insufficient data for indicators`);
-                continue;
-            }
-
-            const latestPrice = prices[prices.length - 1];
-            const previousPrice = prices[prices.length - 2] || latestPrice;
-            const latestEMA20 = ema20[ema20.length - 1];
-            const previousEMA20 = ema20[ema20.length - 2] || latestEMA20;
-            const latestEMA50 = ema50[ema50.length - 1];
-            const latestRSI = rsi9[rsi9.length - 1];
-            const latestVolume = latestPrice.volume;
-            const latestATR = atr14[atr14.length - 1];
-
-            // Calculate session highs and lows (9:45 AM - 3:30 PM ET)
-            const sessionStartHour = 9;
-            const sessionStartMinute = 45;
-            const sessionEndHour = 15;
-            const sessionEndMinute = 30;
-            const sessionCandles = prices.filter(candle => {
-                const hours = candle.time.getUTCHours() - 4;
-                const minutes = candle.time.getUTCMinutes();
-                return (hours > sessionStartHour || (hours === sessionStartHour && minutes >= sessionStartMinute)) &&
-                       (hours < sessionEndHour || (hours === sessionEndHour && minutes <= sessionEndMinute));
-            });
-
-            const sessionHigh = sessionCandles.length > 0 ? Math.max(...sessionCandles.map(c => c.high)) : null;
-            const sessionLow = sessionCandles.length > 0 ? Math.min(...sessionCandles.map(c => c.low)) : null;
-
-            // Calculate Fibonacci levels
-            const fibLevels = sessionHigh && sessionLow ? {
-                high: sessionHigh,
-                low: sessionLow,
-                fib_0: sessionHigh,
-                fib_236: sessionHigh - (sessionHigh - sessionLow) * 0.236,
-                fib_382: sessionHigh - (sessionHigh - sessionLow) * 0.382,
-                fib_500: sessionHigh - (sessionHigh - sessionLow) * 0.500,
-                fib_618: sessionHigh - (sessionHigh - sessionLow) * 0.618,
-                fib_100: sessionLow,
-            } : null;
-
-            // Calculate Support/Resistance Levels (Swing Highs/Lows over last 50 candles)
-            const lookback = 50;
-            const recentCandles = prices.slice(Math.max(0, i - lookback), i + 1);
-            const swingHighs = recentCandles.map((c, idx) => ({
-                high: c.high,
-                idx: idx
-            })).sort((a, b) => b.high - a.high).slice(0, 3); // Top 3 swing highs
-            const swingLows = recentCandles.map((c, idx) => ({
-                low: c.low,
-                idx: idx
-            })).sort((a, b) => a.low - b.low).slice(0, 3); // Top 3 swing lows
-            const resistanceLevels = swingHighs.map(sh => sh.high);
-            const supportLevels = swingLows.map(sl => sl.low);
-
-            // Find nearest support and resistance
-            const nearestSupport = supportLevels.filter(level => level < latestPrice.close).sort((a, b) => b - a)[0] || supportLevels[0];
-            const nearestResistance = resistanceLevels.filter(level => level > latestPrice.close).sort((a, b) => a - b)[0] || resistanceLevels[0];
-
-            // PD Arrays (Premium/Discount Zones)
-            const fairValue = latestEMA20;
-            const premiumZone = fairValue + latestATR;
-            const discountZone = fairValue - latestATR;
-            const isDiscount = latestPrice.close < discountZone;
-            const isPremium = latestPrice.close > premiumZone;
-
-            // FVG Detection
-            let fvgBullish = false;
-            let fvgBearish = false;
-            if (previousPrice.high < latestPrice.low) {
-                fvgBullish = true;
-            }
-            if (previousPrice.low > latestPrice.high) {
-                fvgBearish = true;
-            }
-
-            // Breaker Block Detection
-            let breakerBlockBullish = false;
-            let breakerBlockBearish = false;
-            const bigMoveIndexUp = prices.slice(0, -1).findIndex((p, j) => Math.abs(p.close - prices[j + 1].close) > 50 && p.close < prices[j + 1].close);
-            const bigMoveIndexDown = prices.slice(0, -1).findIndex((p, j) => Math.abs(p.close - prices[j + 1].close) > 50 && p.close > prices[j + 1].close);
-            if (bigMoveIndexUp !== -1) {
-                const orderBlockHigh = prices[bigMoveIndexUp].high;
-                if (latestPrice.high > orderBlockHigh && latestPrice.close < orderBlockHigh && latestVolume > volumeAvg * 1.1) {
-                    breakerBlockBullish = true;
-                }
-            }
-            if (bigMoveIndexDown !== -1) {
-                const orderBlockLow = prices[bigMoveIndexDown].low;
-                if (latestPrice.low < orderBlockLow && latestPrice.close > orderBlockLow && latestVolume > volumeAvg * 1.1) {
-                    breakerBlockBearish = true;
-                }
-            }
-
-            // Confluence: Price Near Fibonacci or Session Levels
-            const isNearFibOrSession = fibLevels && (
-                Math.abs(latestPrice.close - fibLevels.fib_236) < latestATR ||
-                Math.abs(latestPrice.close - fibLevels.fib_382) < latestATR ||
-                Math.abs(latestPrice.close - fibLevels.fib_500) < latestATR ||
-                Math.abs(latestPrice.close - fibLevels.fib_618) < latestATR ||
-                (sessionHigh && Math.abs(latestPrice.close - sessionHigh) < latestATR) ||
-                (sessionLow && Math.abs(latestPrice.close - sessionLow) < latestATR)
-            );
-
-            // Determine Trend (using 50-period EMA)
-            const isUptrend = latestPrice.close > latestEMA50;
-            const isDowntrend = latestPrice.close < latestEMA50;
-
-            // Entry Conditions (Relaxed for more trades)
-            let tradeSignal = null;
-
-            // 1. Opening Range Breakout (9:45 AM)
-            if (hours === 9 && minutes === 45) {
-                const rangeCandles = prices.slice(Math.max(0, i - 3), i + 1);
-                const rangeHigh = Math.max(...rangeCandles.map(c => c.high));
-                const rangeLow = Math.min(...rangeCandles.map(c => c.low));
-                if (isUptrend && latestPrice.close > rangeHigh && latestRSI > 50 && latestVolume > volumeAvg * 1.1 && isDiscount) {
-                    tradeSignal = 'buy';
-                } else if (isDowntrend && latestPrice.close < rangeLow && latestRSI < 50 && latestVolume > volumeAvg * 1.1 && isPremium) {
-                    tradeSignal = 'sell';
-                }
-            }
-
-            // 2. Breakout Pullback
-            if (!tradeSignal) {
-                if (isUptrend && previousPrice.close < previousEMA20 && latestPrice.close > latestEMA20 && latestVolume > volumeAvg * 1.1 && latestRSI > 50 && isDiscount) {
-                    tradeSignal = 'buy';
-                } else if (isDowntrend && previousPrice.close > previousEMA20 && latestPrice.close < latestEMA20 && latestVolume > volumeAvg * 1.1 && latestRSI < 50 && isPremium) {
-                    tradeSignal = 'sell';
-                }
-            }
-
-            // 3. VWAP Bounce (using EMA as proxy)
-            if (!tradeSignal) {
-                if (isUptrend && Math.abs(latestPrice.close - latestEMA20) < 0.5 && latestRSI > 50 && latestVolume > volumeAvg * 1.1 && isDiscount) {
-                    tradeSignal = 'buy';
-                } else if (isDowntrend && Math.abs(latestPrice.close - latestEMA20) < 0.5 && latestRSI < 50 && latestVolume > volumeAvg * 1.1 && isPremium) {
-                    tradeSignal = 'sell';
-                }
-            }
-
-            // 4. Mean Reversion
-            if (!tradeSignal) {
-                if (isUptrend && latestRSI < 40 && latestVolume > volumeAvg * 1.2 && isDiscount) {
-                    tradeSignal = 'buy';
-                } else if (isDowntrend && latestRSI > 60 && latestVolume > volumeAvg * 1.2 && isPremium) {
-                    tradeSignal = 'sell';
-                }
-            }
-
-            // 5. Order Block Break
-            if (!tradeSignal) {
-                if (isUptrend && breakerBlockBullish && isDiscount && latestRSI > 50) {
-                    tradeSignal = 'buy';
-                } else if (isDowntrend && breakerBlockBearish && isPremium && latestRSI < 50) {
-                    tradeSignal = 'sell';
-                }
-            }
-
-            // Simulate trade execution with adaptive stop-loss
-            if (tradeSignal) {
-                const entryPrice = latestPrice.close;
-                let stopLoss = tradeSignal === 'buy' ? nearestSupport : nearestResistance;
-                let takeProfit = tradeSignal === 'buy' ? nearestResistance : nearestSupport;
-
-                // Ensure stop-loss and take-profit are valid
-                if (!stopLoss || !takeProfit || stopLoss === takeProfit) {
-                    console.log(`Skipping trade at ${candle.time}: Invalid stop-loss or take-profit`);
-                    continue;
-                }
-
-                // Calculate initial stop-loss distance
-                let stopLossDistance = tradeSignal === 'buy' ? entryPrice - stopLoss : stopLoss - entryPrice;
-                if (stopLossDistance <= 0) {
-                    console.log(`Skipping trade at ${candle.time}: Invalid stop-loss distance`);
-                    continue;
-                }
-
-                // Calculate number of contracts based on risk
-                const riskPerContract = stopLossDistance * 2; // $2 per point for MNQ/MES
-                let units = Math.floor(riskPerTrade / riskPerContract);
-                units = Math.min(units, 35); // Cap at 35 contracts
-
-                // Ensure take-profit distance is at least 3x stop-loss distance (aiming for $2700-$5400 wins)
-                const targetTakeProfitDistance = stopLossDistance * 3;
-                takeProfit = tradeSignal === 'buy' ? entryPrice + targetTakeProfitDistance : entryPrice - targetTakeProfitDistance;
-
-                // Simulate trade outcome with trailing stop-loss
-                let profitLoss = 0;
-                let tradeClosed = false;
-                let currentStopLoss = stopLoss;
-                let highestHigh = tradeSignal === 'buy' ? entryPrice : null;
-                let lowestLow = tradeSignal === 'sell' ? entryPrice : null;
-                let breakEvenSet = false;
-
-                for (let j = i + 1; j < sessionCandles.length; j++) {
-                    const futureCandle = sessionCandles[j];
-
-                    // Update highest high/lowest low for trailing stop
-                    if (tradeSignal === 'buy') {
-                        highestHigh = Math.max(highestHigh, futureCandle.high);
-                    } else {
-                        lowestLow = Math.min(lowestLow, futureCandle.low);
-                    }
-
-                    // Check if price has moved 1x stop-loss distance in favor to set break-even
-                    if (!breakEvenSet) {
-                        if (tradeSignal === 'buy' && futureCandle.high >= entryPrice + stopLossDistance) {
-                            currentStopLoss = entryPrice; // Set to break-even
-                            breakEvenSet = true;
-                        } else if (tradeSignal === 'sell' && futureCandle.low <= entryPrice - stopLossDistance) {
-                            currentStopLoss = entryPrice; // Set to break-even
-                            breakEvenSet = true;
-                        }
-                    }
-
-                    // Trail stop-loss using 2x ATR
-                    if (breakEvenSet) {
-                        if (tradeSignal === 'buy') {
-                            const trailingStop = highestHigh - (2 * latestATR);
-                            currentStopLoss = Math.max(currentStopLoss, trailingStop);
-                        } else {
-                            const trailingStop = lowestLow + (2 * latestATR);
-                            currentStopLoss = Math.min(currentStopLoss, trailingStop);
-                        }
-                    }
-
-                    // Check if stop-loss or take-profit is hit
-                    if (tradeSignal === 'buy') {
-                        if (futureCandle.low <= currentStopLoss) {
-                            profitLoss = (currentStopLoss - entryPrice) * units * 2;
-                            tradeClosed = true;
-                            break;
-                        } else if (futureCandle.high >= takeProfit) {
-                            profitLoss = (takeProfit - entryPrice) * units * 2;
-                            tradeClosed = true;
-                            break;
-                        }
-                    } else {
-                        if (futureCandle.high >= currentStopLoss) {
-                            profitLoss = (entryPrice - currentStopLoss) * units * 2;
-                            tradeClosed = true;
-                            break;
-                        } else if (futureCandle.low <= takeProfit) {
-                            profitLoss = (entryPrice - takeProfit) * units * 2;
-                            tradeClosed = true;
-                            break;
-                        }
-                    }
-                }
-
-                if (!tradeClosed) {
-                    const lastCandle = sessionCandles[sessionCandles.length - 1];
-                    const priceDiff = tradeSignal === 'buy' ? (lastCandle.close - entryPrice) : (entryPrice - lastCandle.close);
-                    profitLoss = priceDiff * units * 2;
-                    profitLoss = tradeSignal === 'buy' ?
-                        Math.max(Math.min(profitLoss, targetTakeProfitDistance * units * 2), (currentStopLoss - entryPrice) * units * 2) :
-                        Math.max(Math.min(profitLoss, targetTakeProfitDistance * units * 2), (entryPrice - currentStopLoss) * units * 2);
-                }
-
-                trades.push({
-                    timestamp: candle.time,
-                    signal: tradeSignal,
-                    entryPrice: entryPrice,
-                    units: units,
-                    stopLoss: stopLoss,
-                    takeProfit: takeProfit,
-                    profitLoss: profitLoss,
-                });
-
-                totalTrades++;
-                netProfit += profitLoss;
-                if (profitLoss < 0) {
-                    dailyLoss += Math.abs(profitLoss);
-                }
-                tradesToday++;
-                console.log(`Trade executed at ${candle.time}: Signal: ${tradeSignal}, Entry: ${entryPrice}, Units: ${units}, Profit/Loss: $${profitLoss}`);
-            }
-        }
-
-        console.log(`Backtest completed: ${totalTrades} trades, Net Profit: $${netProfit}`);
-        res.json({
-            totalTrades: totalTrades,
-            netProfit: netProfit,
-            trades: trades,
-        });
-    } catch (error) {
-        console.error('Backtesting error:', error.message);
-        res.status(500).json({ error: 'Backtesting error', details: error.message });
+    const { instrument, startDate, strategy } = req.body;
+    if (!instrument || !startDate || !strategy) {
+        return res.status(400).json({ error: 'Instrument, start date, and strategy required' });
     }
+    const contractSymbol = getContractSymbol(instrument, new Date(startDate));
+    const candles = await fetchCandlestickData(contractSymbol, new Date(startDate));
+    let signals;
+    switch (strategy) {
+        case 'ictScalping': signals = ictScalpingStrategy(candles); break;
+        case 'maCrossover': signals = maCrossoverStrategy(candles); break;
+        case 'bollingerSqueeze': signals = bollingerSqueezeStrategy(candles); break;
+        default: return res.status(400).json({ error: 'Invalid strategy' });
+    }
+    const trades = simulateTrades(candles, signals);
+    res.json({ trades });
 });
 
 const PORT = process.env.PORT || 5000;
