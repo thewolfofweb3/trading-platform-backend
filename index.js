@@ -130,7 +130,7 @@ app.post('/api/backtest', async (req, res) => {
         let lastDay = null;
 
         // Process each candle sequentially
-        for (let i = 20; i < filteredCandles.length; i++) {
+        for (let i = 50; i < filteredCandles.length; i++) { // Start after enough candles for support/resistance (50 lookback)
             const candle = filteredCandles[i];
             const currentDay = candle.time.toISOString().split('T')[0];
 
@@ -314,8 +314,8 @@ app.post('/api/backtest', async (req, res) => {
                 fib_100: sessionLow,
             } : null;
 
-            // Calculate Support/Resistance Levels (Swing Highs/Lows over last 20 candles)
-            const lookback = 20;
+            // Calculate Support/Resistance Levels (Swing Highs/Lows over last 50 candles)
+            const lookback = 50;
             const recentCandles = prices.slice(Math.max(0, i - lookback), i + 1);
             const swingHighs = recentCandles.map((c, idx) => ({
                 high: c.high,
@@ -450,7 +450,7 @@ app.post('/api/backtest', async (req, res) => {
                 // Calculate number of contracts based on risk
                 const riskPerContract = stopLossDistance * 2; // $2 per point for MNQ
                 let units = Math.floor(riskPerTrade / riskPerContract);
-                units = Math.min(units, 35); // Cap at 35 contracts based on Tradovate scaling
+                units = Math.min(units, 35); // Cap at 35 contracts
 
                 // Ensure take-profit distance is approximately 2x stop-loss distance
                 const targetTakeProfitDistance = stopLossDistance * 2;
@@ -696,8 +696,8 @@ app.post('/api/start-trading', async (req, res) => {
             (sessionLow && Math.abs(latestPrice.close - sessionLow) < latestATR)
         );
 
-        // Calculate Support/Resistance Levels (Swing Highs/Lows over last 20 candles)
-        const lookback = 20;
+        // Calculate Support/Resistance Levels (Swing Highs/Lows over last 50 candles)
+        const lookback = 50;
         const recentCandles = candles.slice(Math.max(0, candles.length - lookback - 1), candles.length);
         const swingHighs = recentCandles.map((c, idx) => ({
             high: c.high,
