@@ -1,87 +1,30 @@
 // backend/src/index.js
 const express = require('express');
-const axios = require('axios');
-require('dotenv').config();
-const { EMA, RSI, BollingerBands, MACD, ATR } = require('technicalindicators');
 const cors = require('cors');
 
 const app = express();
 app.use(cors({ origin: 'https://futuresairtrading.netlify.app' }));
 app.use(express.json());
 
-const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
-if (!POLYGON_API_KEY) {
-    throw new Error('POLYGON_API_KEY is not set in the .env file. Please add it and restart the server.');
-}
-const POLYGON_API_URL = 'https://api.polygon.io';
-
-// Trading state
-let dailyLoss = 0;
-const dailyLossCap = 4500; // 3% of 150K
-const riskPerTrade = 900; // 0.6% of 150K
-let tradesToday = 0;
-let lastDay = null;
-
-// Determine MNQ/MES contract symbol
-function getFrontMonthContract(instrument, date) {
-    const month = date.getMonth() + 1; // 1-12
-    const year = date.getFullYear() % 100; // Last two digits
-    let contractMonth;
-    if (month <= 3) contractMonth = 'H'; // March
-    else if (month <= 6) contractMonth = 'M'; // June
-    else if (month <= 9) contractMonth = 'U'; // September
-    else contractMonth = 'Z'; // December
-    return `I:${instrument}${contractMonth}${year}`;
-}
-
-// Fetch candlestick data
-async function fetchCandlestickData(instrument, startDate) {
-    const ticker = getFrontMonthContract(instrument, startDate);
-    const endDate = new Date(startDate);
-    endDate.setDate(endDate.getDate() + 1);
-    const startDateStr = startDate.toISOString().split('T')[0];
-    const endDateStr = endDate.toISOString().split('T')[0];
-    console.log(`Fetching data for ${ticker} from ${startDateStr} to ${endDateStr}`);
-    try {
-        const response = await axios.get(
-            `${POLYGON_API_URL}/v2/aggs/ticker/${ticker}/range/5/minute/${startDateStr}/${endDateStr}`,
-            { params: { apiKey: POLYGON_API_KEY } }
-        );
-        if (!response.data.results) {
-            console.log('No results returned from Polygon.io');
-            throw new Error('No results returned from Polygon.io');
-        }
-        const candles = response.data.results.map(candle => ({
-            time: new Date(candle.t),
-            open: candle.o,
-            high: candle.h,
-            low: candle.l,
-            close: candle.c,
-            volume: candle.v,
-            isBullish: candle.c > candle.o,
-        }));
-        console.log(`Fetched ${candles.length} candles for ${ticker}`);
-        return candles;
-    } catch (error) {
-        console.error('Error fetching candles:', error.message);
-        // Fallback to mock data for testing
-        const mockCandles = Array.from({ length: 100 }, (_, i) => {
-            const time = new Date(startDate);
-            time.setMinutes(time.getMinutes() + i * 5);
-            const basePrice = instrument === 'MNQ' ? 18000 : 5700; // Approximate prices for MNQ and MES
-            return {
-                time,
-                open: basePrice + i,
-                high: basePrice + i + 10,
-                low: basePrice + i - 10,
-                close: basePrice + i + 5,
-                volume: 1000 + i * 10,
-                isBullish: i % 2 === 0,
-            };
+// Mock data for testing (replace with Polygon.io API call once confirmed working)
+function generateMockCandles(instrument, startDate) {
+    const candles = [];
+    const basePrice = instrument === 'MNQ' ? 18000 : 5700; // Approximate prices for MNQ and MES
+    for (let i = 0; i < 100; i++) {
+        const time = new Date(startDate);
+        time.setMinutes(time.getMinutes() + i * 5);
+        const price = basePrice + i * 10;
+        candles.push({
+            time,
+            open: price,
+            high: price + 10,
+            low: price - 10,
+            close: price + 5,
+            volume: 1000 + i * 10,
+            isBullish: i % 2 === 0,
         });
-        console.log('Using mock data due to fetch error');
-        return mockCandles;
     }
+    return candles;
 }
 
 // Strategy Implementations
@@ -102,14 +45,25 @@ function ictScalpingStrategy(candles) {
 
 function maCrossoverStrategy(candles) {
     const closes = candles.map(c => c.close);
-    const shortMA = EMA.calculate({ period: 5, values: closes });
-    const longMA = EMA.calculate({ period: 20, values: closes });
+    const shortMA = Array(closes.length).fill(null);
+    const longMA = Array(closes.length).fill(null);
+    let shortSum = 0, longSum = 0;
+    for (let i = 0; i < closes.length; i++) {
+        shortSum += closes[i];
+        longSum += closes[i];
+        if (i >= 5) shortSum -= closes[i - 5];
+        if (i >= 20) longSum -= closes[i - 20];
+        if (i >= 4) shortMA[i] = shortSum / 5;
+        if (i >= 19) longMA[i] = longSum / 20;
+    }
     const signals = [];
     for (let i = 1; i < closes.length; i++) {
-        if (shortMA[i - 1] < longMA[i - 1] && shortMA[i] > longMA[i]) {
-            signals.push({ time: candles[i].time, signal: 'buy' });
-        } else if (shortMA[i - 1] > longMA[i - 1] && shortMA[i] < longMA[i]) {
-            signals.push({ time: candles[i].time, signal: 'sell' });
+        if (shortMA[i - 1] && longMA[i - 1] && shortMA[i] && longMA[i]) {
+            if (shortMA[i - 1] < longMA[i - 1] && shortMA[i] > longMA[i]) {
+                signals.push({ time: candles[i].time, signal: 'buy' });
+            } else if (shortMA[i - 1] > longMA[i - 1] && shortMA[i] < longMA[i]) {
+                signals.push({ time: candles[i].time, signal: 'sell' });
+            }
         }
     }
     return signals;
@@ -117,15 +71,31 @@ function maCrossoverStrategy(candles) {
 
 function bollingerSqueezeStrategy(candles) {
     const closes = candles.map(c => c.close);
-    const bb = BollingerBands.calculate({ period: 20, stdDev: 2, values: closes });
+    const sma = Array(closes.length).fill(null);
+    const bands = [];
+    for (let i = 0; i < closes.length; i++) {
+        if (i >= 20) {
+            const window = closes.slice(i - 20, i);
+            const mean = window.reduce((a, b) => a + b, 0) / 20;
+            sma[i] = mean;
+            const stdDev = Math.sqrt(window.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / 20);
+            bands.push({
+                upper: mean + 2 * stdDev,
+                middle: mean,
+                lower: mean - 2 * stdDev,
+            });
+        } else {
+            bands.push(null);
+        }
+    }
     const signals = [];
     for (let i = 1; i < closes.length; i++) {
-        if (bb[i - 1] && bb[i - 2] && bb[i]) {
-            const bandwidth = (bb[i - 1].upper - bb[i - 1].lower) / bb[i - 1].middle;
-            const prevBandwidth = (bb[i - 2].upper - bb[i - 2].lower) / bb[i - 2].middle;
-            if (bandwidth < 0.1 && closes[i] > bb[i].upper) {
+        if (bands[i - 1] && bands[i - 2] && bands[i]) {
+            const bandwidth = (bands[i - 1].upper - bands[i - 1].lower) / bands[i - 1].middle;
+            const prevBandwidth = (bands[i - 2].upper - bands[i - 2].lower) / bands[i - 2].middle;
+            if (bandwidth < 0.1 && closes[i] > bands[i].upper) {
                 signals.push({ time: candles[i].time, signal: 'buy' });
-            } else if (bandwidth < 0.1 && closes[i] < bb[i].lower) {
+            } else if (bandwidth < 0.1 && closes[i] < bands[i].lower) {
                 signals.push({ time: candles[i].time, signal: 'sell' });
             }
         }
@@ -137,10 +107,10 @@ function bollingerSqueezeStrategy(candles) {
 function simulateTrades(candles, signals) {
     const trades = [];
     let position = null;
-    const atrValues = ATR.calculate({ high: candles.map(c => c.high), low: candles.map(c => c.low), close: candles.map(c => c.close), period: 14 });
+    const atrValues = Array(candles.length).fill(50); // Mock ATR for simplicity
     for (let i = 0; i < candles.length; i++) {
         const signal = signals.find(s => s.time.getTime() === candles[i].time.getTime());
-        const atr = atrValues[i] || 50; // Default ATR if not enough data
+        const atr = atrValues[i];
         if (signal) {
             if (signal.signal === 'buy' && !position) {
                 position = { entry: candles[i].close, stopLoss: candles[i].close - atr, takeProfit: candles[i].close + atr * 3, time: candles[i].time, units: 1 };
@@ -169,22 +139,6 @@ app.get('/', (req, res) => {
     res.json({ message: 'Welcome to the Trading Platform Backend' });
 });
 
-app.get('/api/status', (req, res) => {
-    res.json({ status: 'Backend is running', dailyLoss, tradesToday });
-});
-
-app.get('/api/candles', async (req, res) => {
-    try {
-        const startDateStr = req.query.startDate || new Date(Date.now() - 50 * 5 * 60 * 1000).toISOString().split('T')[0];
-        const instrument = req.query.instrument || 'MNQ';
-        const startDate = new Date(startDateStr);
-        const candles = await fetchCandlestickData(instrument, startDate);
-        res.json({ candles });
-    } catch (error) {
-        res.status(500).json({ error: 'Error fetching candles', details: error.message });
-    }
-});
-
 app.post('/api/backtest', async (req, res) => {
     try {
         const { instrument, startDate, strategy } = req.body;
@@ -196,45 +150,23 @@ app.post('/api/backtest', async (req, res) => {
             return res.status(400).json({ error: 'Start date must be in the past' });
         }
 
-        const candles = await fetchCandlestickData(instrument, new Date(startDate));
-        if (!candles || candles.length === 0) {
-            return res.status(404).json({ error: 'No data available for the selected period' });
-        }
-
-        const startDateTime = new Date(startDate);
-        startDateTime.setUTCHours(13, 45, 0, 0); // 9:45 AM ET
-        const endDateTime = new Date(startDate);
-        endDateTime.setUTCHours(23, 59, 59, 999); // End of day
-        const filteredCandles = candles.filter(candle => candle.time >= startDateTime && candle.time <= endDateTime);
-        console.log(`After date filtering: ${filteredCandles.length} candles`);
-
-        if (filteredCandles.length === 0) {
-            return res.status(404).json({ error: 'No data available for the selected date after filtering' });
-        }
-
-        const sessionCandles = filteredCandles.filter(candle => {
-            const hours = candle.time.getUTCHours() - 4;
-            const minutes = candle.time.getUTCMinutes();
-            return (hours === 9 && minutes >= 45) || (hours === 10) || (hours === 11 && minutes <= 30) ||
-                   (hours === 13 && minutes >= 30) || (hours === 14) || (hours === 15 && minutes <= 30);
-        });
-        console.log(`After trading window filtering: ${sessionCandles.length} candles`);
-
-        if (sessionCandles.length === 0) {
-            return res.status(404).json({ error: 'No data available within the trading window' });
-        }
+        const candles = generateMockCandles(instrument, new Date(startDate));
+        console.log(`Generated ${candles.length} mock candles for ${instrument}`);
 
         let signals;
         switch (strategy) {
-            case 'ictScalping': signals = ictScalpingStrategy(sessionCandles); break;
-            case 'maCrossover': signals = maCrossoverStrategy(sessionCandles); break;
-            case 'bollingerSqueeze': signals = bollingerSqueezeStrategy(sessionCandles); break;
+            case 'ictScalping': signals = ictScalpingStrategy(candles); break;
+            case 'maCrossover': signals = maCrossoverStrategy(candles); break;
+            case 'bollingerSqueeze': signals = bollingerSqueezeStrategy(candles); break;
             default: return res.status(400).json({ error: 'Invalid strategy' });
         }
+        console.log(`Generated ${signals.length} signals`);
 
-        const trades = simulateTrades(sessionCandles, signals);
+        const trades = simulateTrades(candles, signals);
+        console.log(`Simulated ${trades.length} trades`);
+
         const netProfit = trades.reduce((sum, trade) => sum + trade.profitLoss, 0);
-        const chartData = sessionCandles.map(candle => ({
+        const chartData = candles.map(candle => ({
             time: Math.floor(candle.time.getTime() / 1000),
             open: candle.open,
             high: candle.high,
