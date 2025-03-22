@@ -1,0 +1,2 @@
+cd path/to/your/backend/repository
+npm install @polygon.io/client-js
