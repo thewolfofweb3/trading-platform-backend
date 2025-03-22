@@ -103,6 +103,14 @@ app.post('/api/backtest', async (req, res) => {
             return res.status(404).json({ error: 'No data available for the selected period' });
         }
 
+        // Filter candles to start from the New York session open (9:45 AM ET) on the start date
+        const startDateTime = new Date(startDate);
+        startDateTime.setUTCHours(13, 45, 0, 0); // 9:45 AM ET = 13:45 UTC
+        const filteredCandles = candles.filter(candle => candle.time >= startDateTime);
+        if (filteredCandles.length === 0) {
+            return res.status(404).json({ error: 'No data available after the New York session open on the selected date' });
+        }
+
         // Backtest state
         let trades = [];
         let netProfit = 0;
@@ -112,8 +120,8 @@ app.post('/api/backtest', async (req, res) => {
         let lastDay = null;
 
         // Process each candle sequentially
-        for (let i = 0; i < candles.length; i++) {
-            const candle = candles[i];
+        for (let i = 0; i < filteredCandles.length; i++) {
+            const candle = filteredCandles[i];
             const currentDay = candle.time.toISOString().split('T')[0];
 
             // Reset daily stats at the start of a new day
@@ -132,8 +140,8 @@ app.post('/api/backtest', async (req, res) => {
                 continue;
             }
 
-            // Use only candles up to the current index for indicators
-            const prices = candles.slice(0, i + 1);
+            // Use only candles up to the current index for indicators (no look-ahead)
+            const prices = filteredCandles.slice(0, i + 1);
             const closes = prices.map(p => p.close);
             const highs = prices.map(p => p.high);
             const lows = prices.map(p => p.low);
@@ -141,9 +149,9 @@ app.post('/api/backtest', async (req, res) => {
             const rsi9 = RSI.calculate({ period: 9, values: closes });
             const atr14 = ATR.calculate({ high: highs, low: lows, close: closes, period: 14 });
             const volumes = prices.map(p => p.volume);
-            const volumeAvg = volumes.slice(-10).reduce((a, b) => a + b, 0) / 10;
+            const volumeAvg = volumes.slice(-Math.min(10, volumes.length)).reduce((a, b) => a + b, 0) / Math.min(10, volumes.length);
 
-            if (ema20.length === 0 || rsi9.length === 0 || atr14.length === 0) {
+            if (ema20.length < 20 || rsi9.length < 9 || atr14.length < 14) {
                 continue; // Skip if indicators are not yet calculated
             }
 
@@ -260,15 +268,24 @@ app.post('/api/backtest', async (req, res) => {
 
                 // Simulate trade outcome (for backtesting only)
                 let profitLoss = 0;
-                for (let j = i + 1; j < candles.length; j++) {
-                    const futureCandle = candles[j];
+                let tradeClosed = false;
+                for (let j = i + 1; j < filteredCandles.length; j++) {
+                    const futureCandle = filteredCandles[j];
                     if (futureCandle.low <= stopLoss) {
                         profitLoss = -4 * units; // Loss
+                        tradeClosed = true;
                         break;
                     } else if (futureCandle.high >= takeProfit) {
                         profitLoss = 4 * units; // Profit
+                        tradeClosed = true;
                         break;
                     }
+                }
+
+                if (!tradeClosed) {
+                    // If trade doesn't close by the end of the data, calculate profit/loss based on the last candle
+                    const lastCandle = filteredCandles[filteredCandles.length - 1];
+                    profitLoss = (lastCandle.close - latestPrice.close) * units;
                 }
 
                 trades.push({
