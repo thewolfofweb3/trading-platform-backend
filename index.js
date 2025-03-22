@@ -27,7 +27,7 @@ app.get('/api/status', (req, res) => {
     res.json({ status: 'Backend is running', dailyLoss, tradesToday });
 });
 
-// Fetch candlestick data from Polygon.io
+// Fetch candlestick data from Polygon.io for MNQ
 async function fetchCandlestickData(instrument, startDate) {
     try {
         const endDate = new Date().toISOString().split('T')[0]; // Today
@@ -45,7 +45,7 @@ async function fetchCandlestickData(instrument, startDate) {
         const candles = response.data.results;
         console.log(`Fetched ${candles.length} candles`);
         return candles.map(candle => ({
-            time: new Date(candle.t), // Keep the full timestamp with seconds
+            time: new Date(candle.t),
             open: candle.o,
             high: candle.h,
             low: candle.l,
@@ -61,8 +61,8 @@ async function fetchCandlestickData(instrument, startDate) {
 
 app.get('/api/candles', async (req, res) => {
     try {
-        const startDate = req.query.startDate || new Date(Date.now() - 50 * 5 * 60 * 1000).toISOString().split('T')[0]; // Default to 50 candles ago
-        const candles = await fetchCandlestickData('QQQ', startDate);
+        const startDate = req.query.startDate || new Date(Date.now() - 50 * 5 * 60 * 1000).toISOString().split('T')[0];
+        const candles = await fetchCandlestickData('I:MNQH25', startDate); // MNQ March 2025 contract
 
         // Calculate session highs and lows (9:45 AM - 3:30 PM ET)
         const sessionStartHour = 9;
@@ -70,7 +70,7 @@ app.get('/api/candles', async (req, res) => {
         const sessionEndHour = 15;
         const sessionEndMinute = 30;
         const sessionCandles = candles.filter(candle => {
-            const hours = candle.time.getUTCHours() - 4; // Convert UTC to ET
+            const hours = candle.time.getUTCHours() - 4;
             const minutes = candle.time.getUTCMinutes();
             return (hours > sessionStartHour || (hours === sessionStartHour && minutes >= sessionStartMinute)) &&
                    (hours < sessionEndHour || (hours === sessionEndHour && minutes <= sessionEndMinute));
@@ -99,7 +99,7 @@ app.get('/api/candles', async (req, res) => {
 
 app.post('/api/backtest', async (req, res) => {
     try {
-        const instrument = req.query.instrument || 'QQQ';
+        const instrument = req.query.instrument || 'I:MNQH25'; // MNQ March 2025 contract
         const startDate = req.query.startDate;
         if (!startDate) {
             return res.status(400).json({ error: 'Start date is required' });
@@ -130,7 +130,7 @@ app.post('/api/backtest', async (req, res) => {
         let lastDay = null;
 
         // Process each candle sequentially
-        for (let i = 20; i < filteredCandles.length; i++) { // Start after enough candles for EMA(20)
+        for (let i = 20; i < filteredCandles.length; i++) {
             const candle = filteredCandles[i];
             const currentDay = candle.time.toISOString().split('T')[0];
 
@@ -314,6 +314,24 @@ app.post('/api/backtest', async (req, res) => {
                 fib_100: sessionLow,
             } : null;
 
+            // Calculate Support/Resistance Levels (Swing Highs/Lows over last 20 candles)
+            const lookback = 20;
+            const recentCandles = prices.slice(Math.max(0, i - lookback), i + 1);
+            const swingHighs = recentCandles.map((c, idx) => ({
+                high: c.high,
+                idx: idx
+            })).sort((a, b) => b.high - a.high).slice(0, 3); // Top 3 swing highs
+            const swingLows = recentCandles.map((c, idx) => ({
+                low: c.low,
+                idx: idx
+            })).sort((a, b) => a.low - b.low).slice(0, 3); // Top 3 swing lows
+            const resistanceLevels = swingHighs.map(sh => sh.high);
+            const supportLevels = swingLows.map(sl => sl.low);
+
+            // Find nearest support and resistance
+            const nearestSupport = supportLevels.filter(level => level < latestPrice.close).sort((a, b) => b - a)[0] || supportLevels[0];
+            const nearestResistance = resistanceLevels.filter(level => level > latestPrice.close).sort((a, b) => a - b)[0] || resistanceLevels[0];
+
             // PD Arrays (Premium/Discount Zones)
             const fairValue = latestEMA;
             const premiumZone = fairValue + latestATR;
@@ -412,10 +430,31 @@ app.post('/api/backtest', async (req, res) => {
 
             // Simulate trade execution
             if (tradeSignal) {
-                const units = Math.floor(riskPerTrade / 4); // $900 / 4 points = 225 units
                 const entryPrice = latestPrice.close;
-                const stopLoss = tradeSignal === 'buy' ? entryPrice - 4 : entryPrice + 4;
-                const takeProfit = tradeSignal === 'buy' ? entryPrice + 8 : entryPrice - 8; // 2:1 risk-reward
+                const stopLoss = tradeSignal === 'buy' ? nearestSupport : nearestResistance;
+                const takeProfit = tradeSignal === 'buy' ? nearestResistance : nearestSupport;
+
+                // Ensure stop-loss and take-profit are valid
+                if (!stopLoss || !takeProfit || stopLoss === takeProfit) {
+                    console.log(`Skipping trade at ${candle.time}: Invalid stop-loss or take-profit`);
+                    continue;
+                }
+
+                // Calculate stop-loss distance
+                const stopLossDistance = tradeSignal === 'buy' ? entryPrice - stopLoss : stopLoss - entryPrice;
+                if (stopLossDistance <= 0) {
+                    console.log(`Skipping trade at ${candle.time}: Invalid stop-loss distance`);
+                    continue;
+                }
+
+                // Calculate number of contracts based on risk
+                const riskPerContract = stopLossDistance * 2; // $2 per point for MNQ
+                let units = Math.floor(riskPerTrade / riskPerContract);
+                units = Math.min(units, 35); // Cap at 35 contracts based on Tradovate scaling
+
+                // Ensure take-profit distance is approximately 2x stop-loss distance
+                const targetTakeProfitDistance = stopLossDistance * 2;
+                const adjustedTakeProfit = tradeSignal === 'buy' ? entryPrice + targetTakeProfitDistance : entryPrice - targetTakeProfitDistance;
 
                 // Simulate trade outcome
                 let profitLoss = 0;
@@ -424,21 +463,21 @@ app.post('/api/backtest', async (req, res) => {
                     const futureCandle = filteredCandles[j];
                     if (tradeSignal === 'buy') {
                         if (futureCandle.low <= stopLoss) {
-                            profitLoss = -4 * units; // Loss capped at $900
+                            profitLoss = -stopLossDistance * units * 2; // Loss based on stop-loss distance
                             tradeClosed = true;
                             break;
-                        } else if (futureCandle.high >= takeProfit) {
-                            profitLoss = 8 * units; // Win at $1800
+                        } else if (futureCandle.high >= adjustedTakeProfit) {
+                            profitLoss = targetTakeProfitDistance * units * 2; // Win based on take-profit distance
                             tradeClosed = true;
                             break;
                         }
                     } else {
                         if (futureCandle.high >= stopLoss) {
-                            profitLoss = -4 * units; // Loss capped at $900
+                            profitLoss = -stopLossDistance * units * 2; // Loss based on stop-loss distance
                             tradeClosed = true;
                             break;
-                        } else if (futureCandle.low <= takeProfit) {
-                            profitLoss = 8 * units; // Win at $1800
+                        } else if (futureCandle.low <= adjustedTakeProfit) {
+                            profitLoss = targetTakeProfitDistance * units * 2; // Win based on take-profit distance
                             tradeClosed = true;
                             break;
                         }
@@ -447,8 +486,11 @@ app.post('/api/backtest', async (req, res) => {
 
                 if (!tradeClosed) {
                     const lastCandle = filteredCandles[filteredCandles.length - 1];
-                    profitLoss = tradeSignal === 'buy' ? (lastCandle.close - entryPrice) * units : (entryPrice - lastCandle.close) * units;
-                    profitLoss = tradeSignal === 'buy' ? Math.max(Math.min(profitLoss, 8 * units), -4 * units) : Math.max(Math.min(profitLoss, 8 * units), -4 * units);
+                    const priceDiff = tradeSignal === 'buy' ? (lastCandle.close - entryPrice) : (entryPrice - lastCandle.close);
+                    profitLoss = priceDiff * units * 2;
+                    profitLoss = tradeSignal === 'buy' ?
+                        Math.max(Math.min(profitLoss, targetTakeProfitDistance * units * 2), -stopLossDistance * units * 2) :
+                        Math.max(Math.min(profitLoss, targetTakeProfitDistance * units * 2), -stopLossDistance * units * 2);
                 }
 
                 trades.push({
@@ -457,7 +499,7 @@ app.post('/api/backtest', async (req, res) => {
                     entryPrice: entryPrice,
                     units: units,
                     stopLoss: stopLoss,
-                    takeProfit: takeProfit,
+                    takeProfit: adjustedTakeProfit,
                     profitLoss: profitLoss,
                 });
 
@@ -467,7 +509,7 @@ app.post('/api/backtest', async (req, res) => {
                     dailyLoss += Math.abs(profitLoss);
                 }
                 tradesToday++;
-                console.log(`Trade executed at ${candle.time}: Signal: ${tradeSignal}, Entry: ${entryPrice}, Profit/Loss: $${profitLoss}`);
+                console.log(`Trade executed at ${candle.time}: Signal: ${tradeSignal}, Entry: ${entryPrice}, Units: ${units}, Profit/Loss: $${profitLoss}`);
             }
         }
 
@@ -486,7 +528,7 @@ app.post('/api/backtest', async (req, res) => {
 app.post('/api/start-trading', async (req, res) => {
     try {
         const startDate = req.query.startDate || new Date(Date.now() - 50 * 5 * 60 * 1000).toISOString().split('T')[0];
-        const candles = await fetchCandlestickData('QQQ', startDate);
+        const candles = await fetchCandlestickData('I:MNQH25', startDate);
 
         // Process the latest candle for real-time trading
         const latestPrice = candles[candles.length - 1];
@@ -654,6 +696,24 @@ app.post('/api/start-trading', async (req, res) => {
             (sessionLow && Math.abs(latestPrice.close - sessionLow) < latestATR)
         );
 
+        // Calculate Support/Resistance Levels (Swing Highs/Lows over last 20 candles)
+        const lookback = 20;
+        const recentCandles = candles.slice(Math.max(0, candles.length - lookback - 1), candles.length);
+        const swingHighs = recentCandles.map((c, idx) => ({
+            high: c.high,
+            idx: idx
+        })).sort((a, b) => b.high - a.high).slice(0, 3); // Top 3 swing highs
+        const swingLows = recentCandles.map((c, idx) => ({
+            low: c.low,
+            idx: idx
+        })).sort((a, b) => a.low - b.low).slice(0, 3); // Top 3 swing lows
+        const resistanceLevels = swingHighs.map(sh => sh.high);
+        const supportLevels = swingLows.map(sl => sl.low);
+
+        // Find nearest support and resistance
+        const nearestSupport = supportLevels.filter(level => level < latestPrice.close).sort((a, b) => b - a)[0] || supportLevels[0];
+        const nearestResistance = resistanceLevels.filter(level => level > latestPrice.close).sort((a, b) => a - b)[0] || resistanceLevels[0];
+
         // Entry Conditions
         let tradeSignal = null;
 
@@ -706,12 +766,40 @@ app.post('/api/start-trading', async (req, res) => {
         }
 
         if (tradeSignal) {
-            const units = Math.floor(riskPerTrade / 4); // $900 / 4 points = 225 units
             const entryPrice = latestPrice.close;
-            const stopLoss = tradeSignal === 'buy' ? entryPrice - 4 : entryPrice + 4;
-            const takeProfit = tradeSignal === 'buy' ? entryPrice + 8 : entryPrice - 8; // 2:1 risk-reward
+            const stopLoss = tradeSignal === 'buy' ? nearestSupport : nearestResistance;
+            const takeProfit = tradeSignal === 'buy' ? nearestResistance : nearestSupport;
+
+            // Ensure stop-loss and take-profit are valid
+            if (!stopLoss || !takeProfit || stopLoss === takeProfit) {
+                return res.json({ message: 'Invalid stop-loss or take-profit', timestamp: latestPrice.time });
+            }
+
+            // Calculate stop-loss distance
+            const stopLossDistance = tradeSignal === 'buy' ? entryPrice - stopLoss : stopLoss - entryPrice;
+            if (stopLossDistance <= 0) {
+                return res.json({ message: 'Invalid stop-loss distance', timestamp: latestPrice.time });
+            }
+
+            // Calculate number of contracts based on risk
+            const riskPerContract = stopLossDistance * 2; // $2 per point for MNQ
+            let units = Math.floor(riskPerTrade / riskPerContract);
+            units = Math.min(units, 35); // Cap at 35 contracts
+
+            // Ensure take-profit distance is approximately 2x stop-loss distance
+            const targetTakeProfitDistance = stopLossDistance * 2;
+            const adjustedTakeProfit = tradeSignal === 'buy' ? entryPrice + targetTakeProfitDistance : entryPrice - targetTakeProfitDistance;
+
             tradesToday++;
-            res.json({ message: 'Trade executed', signal: tradeSignal, entryPrice, units, stopLoss, takeProfit, timestamp: latestPrice.time });
+            res.json({
+                message: 'Trade executed',
+                signal: tradeSignal,
+                entryPrice: entryPrice,
+                units: units,
+                stopLoss: stopLoss,
+                takeProfit: adjustedTakeProfit,
+                timestamp: latestPrice.time
+            });
         } else {
             res.json({ message: 'No trade signal', timestamp: latestPrice.time });
         }
