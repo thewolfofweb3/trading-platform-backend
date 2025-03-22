@@ -1,23 +1,19 @@
 // backend/src/index.js
 const express = require('express');
-const { restClient, websocketClient } = require('@polygon.io/client-js');
+const axios = require('axios');
 require('dotenv').config();
 const { EMA, RSI, BollingerBands, MACD, ATR } = require('technicalindicators');
 const cors = require('cors');
-const WebSocket = require('ws');
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: 'https://futuresairtrading.netlify.app' }));
 app.use(express.json());
 
 const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
 if (!POLYGON_API_KEY) {
     throw new Error('POLYGON_API_KEY is not set in the .env file. Please add it and restart the server.');
 }
-
-// Initialize Polygon.io REST and WebSocket clients
-const rest = restClient(POLYGON_API_KEY);
-const ws = websocketClient(POLYGON_API_KEY);
+const POLYGON_API_URL = 'https://api.polygon.io';
 
 // Trading state
 let dailyLoss = 0;
@@ -26,64 +22,19 @@ const riskPerTrade = 900; // 0.6% of 150K
 let tradesToday = 0;
 let lastDay = null;
 
-// Set up WebSocket server to broadcast real-time data to the frontend
-const wss = new WebSocket.Server({ port: 8080 });
-wss.on('connection', (wsClient) => {
-    console.log('Frontend WebSocket client connected');
-    wsClient.on('message', (message) => {
-        const { instrument } = JSON.parse(message);
-        console.log(`Subscribing to real-time data for ${instrument}`);
-
-        // Subscribe to real-time trades for the specified instrument
-        ws.subscribe(`T.${instrument}`);
-    });
-
-    wsClient.on('close', () => {
-        console.log('Frontend WebSocket client disconnected');
-        ws.unsubscribeAll();
-    });
-});
-
-// Handle real-time trade updates from Polygon.io
-ws.on('message', (data) => {
-    const message = JSON.parse(data);
-    if (message.ev === 'T') { // Trade event
-        const trade = {
-            instrument: message.sym,
-            price: message.p,
-            size: message.s,
-            timestamp: new Date(message.t).toISOString(),
-        };
-        console.log('Received trade:', trade);
-
-        // Broadcast the trade to all connected frontend clients
-        wss.clients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify(trade));
-            }
-        });
-    }
-});
-
-ws.on('error', (error) => {
-    console.error('WebSocket error:', error);
-});
-
-ws.on('open', () => {
-    console.log('Connected to Polygon.io WebSocket');
-});
-
 // Determine MNQ/MES contract symbol
 function getFrontMonthContract(instrument, date) {
     const month = date.getMonth() + 1; // 1-12
     const year = date.getFullYear() % 100; // Last two digits
-    if (month <= 3) return `${instrument}H${year}`; // March
-    if (month <= 6) return `${instrument}M${year}`; // June
-    if (month <= 9) return `${instrument}U${year}`; // September
-    return `${instrument}Z${year}`; // December
+    let contractMonth;
+    if (month <= 3) contractMonth = 'H'; // March
+    else if (month <= 6) contractMonth = 'M'; // June
+    else if (month <= 9) contractMonth = 'U'; // September
+    else contractMonth = 'Z'; // December
+    return `I:${instrument}${contractMonth}${year}`;
 }
 
-// Fetch candlestick data (for backtesting)
+// Fetch candlestick data
 async function fetchCandlestickData(instrument, startDate) {
     const ticker = getFrontMonthContract(instrument, startDate);
     const endDate = new Date(startDate);
@@ -92,11 +43,15 @@ async function fetchCandlestickData(instrument, startDate) {
     const endDateStr = endDate.toISOString().split('T')[0];
     console.log(`Fetching data for ${ticker} from ${startDateStr} to ${endDateStr}`);
     try {
-        const response = await rest.stocks.aggregates(ticker, 5, 'minute', startDateStr, endDateStr);
-        if (!response.results) {
+        const response = await axios.get(
+            `${POLYGON_API_URL}/v2/aggs/ticker/${ticker}/range/5/minute/${startDateStr}/${endDateStr}`,
+            { params: { apiKey: POLYGON_API_KEY } }
+        );
+        if (!response.data.results) {
+            console.log('No results returned from Polygon.io');
             throw new Error('No results returned from Polygon.io');
         }
-        const candles = response.results.map(candle => ({
+        const candles = response.data.results.map(candle => ({
             time: new Date(candle.t),
             open: candle.o,
             high: candle.h,
