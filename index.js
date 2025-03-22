@@ -44,7 +44,7 @@ async function fetchCandlestickData(instrument, startDate) {
         const candles = response.data.results;
         console.log(`Fetched ${candles.length} candles`);
         return candles.map(candle => ({
-            time: new Date(candle.t),
+            time: new Date(candle.t), // Keep the full timestamp with seconds
             open: candle.o,
             high: candle.h,
             low: candle.l,
@@ -232,7 +232,7 @@ app.post('/api/backtest', async (req, res) => {
                 (sessionLow && Math.abs(latestPrice.close - sessionLow) < latestATR)
             );
 
-            // Entry Conditions (Simplified for backtesting)
+            // Entry Conditions (Simplified and adjusted for backtesting)
             let tradeSignal = null;
 
             // 1. Opening Range Breakout (9:45 AM)
@@ -268,9 +268,10 @@ app.post('/api/backtest', async (req, res) => {
 
             // Simulate trade execution
             if (tradeSignal === 'buy') {
-                const units = Math.floor(riskPerTrade / 2); // $2 stop loss per unit
-                const stopLoss = latestPrice.close - 4;
-                const takeProfit = latestPrice.close + 4;
+                const units = Math.floor(riskPerTrade / 4); // $900 / 4 points = 225 units
+                const entryPrice = latestPrice.close;
+                const stopLoss = entryPrice - 4;
+                const takeProfit = entryPrice + 4;
 
                 // Simulate trade outcome
                 let profitLoss = 0;
@@ -278,11 +279,11 @@ app.post('/api/backtest', async (req, res) => {
                 for (let j = i + 1; j < filteredCandles.length; j++) {
                     const futureCandle = filteredCandles[j];
                     if (futureCandle.low <= stopLoss) {
-                        profitLoss = -4 * units; // Loss
+                        profitLoss = -4 * units; // Loss capped at $900
                         tradeClosed = true;
                         break;
                     } else if (futureCandle.high >= takeProfit) {
-                        profitLoss = 4 * units; // Profit
+                        profitLoss = 4 * units; // Profit at $900
                         tradeClosed = true;
                         break;
                     }
@@ -290,12 +291,14 @@ app.post('/api/backtest', async (req, res) => {
 
                 if (!tradeClosed) {
                     const lastCandle = filteredCandles[filteredCandles.length - 1];
-                    profitLoss = (lastCandle.close - latestPrice.close) * units;
+                    profitLoss = (lastCandle.close - entryPrice) * units;
+                    profitLoss = Math.max(Math.min(profitLoss, 4 * units), -4 * units); // Cap at $900 profit/loss
                 }
 
                 trades.push({
                     timestamp: candle.time,
                     signal: tradeSignal,
+                    entryPrice: entryPrice,
                     units: units,
                     stopLoss: stopLoss,
                     takeProfit: takeProfit,
@@ -308,7 +311,7 @@ app.post('/api/backtest', async (req, res) => {
                     dailyLoss += Math.abs(profitLoss);
                 }
                 tradesToday++;
-                console.log(`Trade executed at ${candle.time}: Signal: ${tradeSignal}, Profit/Loss: $${profitLoss}`);
+                console.log(`Trade executed at ${candle.time}: Signal: ${tradeSignal}, Entry: ${entryPrice}, Profit/Loss: $${profitLoss}`);
             }
         }
 
@@ -417,7 +420,7 @@ app.post('/api/start-trading', async (req, res) => {
             (sessionLow && Math.abs(latestPrice.close - sessionLow) < latestATR)
         );
 
-        // Entry Conditions (Simplified for real-time trading)
+        // Entry Conditions
         let tradeSignal = null;
 
         // 1. Opening Range Breakout (9:45 AM)
@@ -452,11 +455,12 @@ app.post('/api/start-trading', async (req, res) => {
         }
 
         if (tradeSignal === 'buy') {
-            const units = Math.floor(riskPerTrade / 2);
-            const stopLoss = latestPrice.close - 4;
-            const takeProfit = latestPrice.close + 4;
+            const units = Math.floor(riskPerTrade / 4); // $900 / 4 points = 225 units
+            const entryPrice = latestPrice.close;
+            const stopLoss = entryPrice - 4;
+            const takeProfit = entryPrice + 4;
             tradesToday++;
-            res.json({ message: 'Trade executed', signal: tradeSignal, units, stopLoss, takeProfit, timestamp: latestPrice.time });
+            res.json({ message: 'Trade executed', signal: tradeSignal, entryPrice, units, stopLoss, takeProfit, timestamp: latestPrice.time });
         } else {
             res.json({ message: 'No trade signal', timestamp: latestPrice.time });
         }
