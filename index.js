@@ -1,22 +1,21 @@
-// backend/src/index.js
 const express = require('express');
 const cors = require('cors');
 
 const app = express();
-app.use(cors({ origin: 'https://futuresairtrading.netlify.app' })); // Update with your Netlify URL
+app.use(cors({ origin: 'https://futuresairtrading.netlify.app' }));
 app.use(express.json());
 
-// Generate mock candlestick data for testing
+// Mock candlestick data generator
 function generateMockCandles(instrument, startDate) {
     const candles = [];
-    const basePrice = instrument === 'MNQ' ? 18000 : 5700; // Approximate prices for MNQ and MES
+    const basePrice = instrument === 'MNQ' ? 18000 : 5700;
     const start = new Date(startDate);
     for (let i = 0; i < 100; i++) {
         const time = new Date(start);
         time.setMinutes(start.getMinutes() + i * 5);
         const price = basePrice + i * 10;
         candles.push({
-            time: Math.floor(time.getTime() / 1000), // Unix timestamp in seconds
+            time: Math.floor(time.getTime() / 1000),
             open: price,
             high: price + 10,
             low: price - 10,
@@ -26,7 +25,7 @@ function generateMockCandles(instrument, startDate) {
     return candles;
 }
 
-// Simple backtesting strategy for testing
+// Simple trend-following strategy
 function runStrategy(candles) {
     const trades = [];
     for (let i = 1; i < candles.length; i++) {
