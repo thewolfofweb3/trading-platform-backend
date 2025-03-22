@@ -30,13 +30,19 @@ app.get('/api/status', (req, res) => {
 async function fetchCandlestickData(instrument, startDate) {
     try {
         const endDate = new Date().toISOString().split('T')[0]; // Today
+        console.log(`Fetching data for ${instrument} from ${startDate} to ${endDate}`);
         const response = await axios.get(`${POLYGON_API_URL}/v2/aggs/ticker/${instrument}/range/5/minute/${startDate}/${endDate}`, {
             params: {
                 apiKey: POLYGON_API_KEY,
             },
         });
 
+        if (!response.data.results) {
+            throw new Error('No results returned from Polygon.io');
+        }
+
         const candles = response.data.results;
+        console.log(`Fetched ${candles.length} candles`);
         return candles.map(candle => ({
             time: new Date(candle.t),
             open: candle.o,
@@ -47,13 +53,14 @@ async function fetchCandlestickData(instrument, startDate) {
             isBullish: candle.c > candle.o,
         }));
     } catch (error) {
+        console.error('Error fetching candles:', error.message);
         throw new Error(`Error fetching candles: ${error.message}`);
     }
 }
 
 app.get('/api/candles', async (req, res) => {
     try {
-        const startDate = req.query.startDate || new Date(Date.now() - 50 * 5 * 60 * 1000).toISOString().split('T')[0]; // Default to 50 candles ago if no start date
+        const startDate = req.query.startDate || new Date(Date.now() - 50 * 5 * 60 * 1000).toISOString().split('T')[0]; // Default to 50 candles ago
         const candles = await fetchCandlestickData('QQQ', startDate);
 
         // Calculate session highs and lows (9:45 AM - 3:30 PM ET)
@@ -71,7 +78,7 @@ app.get('/api/candles', async (req, res) => {
         const sessionHigh = sessionCandles.length > 0 ? Math.max(...sessionCandles.map(c => c.high)) : null;
         const sessionLow = sessionCandles.length > 0 ? Math.min(...sessionCandles.map(c => c.low)) : null;
 
-        // Calculate Fibonacci levels (based on session high and low)
+        // Calculate Fibonacci levels
         const fibLevels = sessionHigh && sessionLow ? {
             high: sessionHigh,
             low: sessionLow,
@@ -111,6 +118,8 @@ app.post('/api/backtest', async (req, res) => {
             return res.status(404).json({ error: 'No data available after the New York session open on the selected date' });
         }
 
+        console.log(`Processing ${filteredCandles.length} candles for backtest`);
+
         // Backtest state
         let trades = [];
         let netProfit = 0;
@@ -120,7 +129,7 @@ app.post('/api/backtest', async (req, res) => {
         let lastDay = null;
 
         // Process each candle sequentially
-        for (let i = 0; i < filteredCandles.length; i++) {
+        for (let i = 20; i < filteredCandles.length; i++) { // Start after enough candles for EMA(20)
             const candle = filteredCandles[i];
             const currentDay = candle.time.toISOString().split('T')[0];
 
@@ -132,7 +141,7 @@ app.post('/api/backtest', async (req, res) => {
             lastDay = currentDay;
 
             // Skip if outside trading window (9:45 AM - 11:30 AM ET and 1:30 PM - 3:30 PM ET)
-            const hours = candle.time.getUTCHours() - 4; // Convert UTC to ET
+            const hours = candle.time.getUTCHours() - 4;
             const minutes = candle.time.getUTCMinutes();
             const isTradingWindow = (hours === 9 && minutes >= 45) || (hours === 10) || (hours === 11 && minutes <= 30) ||
                                    (hours === 13 && minutes >= 30) || (hours === 14) || (hours === 15 && minutes <= 30);
@@ -152,7 +161,8 @@ app.post('/api/backtest', async (req, res) => {
             const volumeAvg = volumes.slice(-Math.min(10, volumes.length)).reduce((a, b) => a + b, 0) / Math.min(10, volumes.length);
 
             if (ema20.length < 20 || rsi9.length < 9 || atr14.length < 14) {
-                continue; // Skip if indicators are not yet calculated
+                console.log(`Skipping candle at ${candle.time}: insufficient data for indicators`);
+                continue;
             }
 
             const latestPrice = prices[prices.length - 1];
@@ -222,41 +232,37 @@ app.post('/api/backtest', async (req, res) => {
                 (sessionLow && Math.abs(latestPrice.close - sessionLow) < latestATR)
             );
 
-            // Entry Conditions
+            // Entry Conditions (Simplified for backtesting)
             let tradeSignal = null;
 
             // 1. Opening Range Breakout (9:45 AM)
             if (hours === 9 && minutes === 45) {
-                const rangeCandles = prices.slice(Math.max(0, i - 3), i + 1); // Last 3 candles
+                const rangeCandles = prices.slice(Math.max(0, i - 3), i + 1);
                 const rangeHigh = Math.max(...rangeCandles.map(c => c.high));
-                if (latestPrice.close > rangeHigh && latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isDiscount && isNearFibOrSession) {
+                if (latestPrice.close > rangeHigh && latestRSI > 60 && latestVolume > volumeAvg * 1.2 && isDiscount) {
                     tradeSignal = 'buy';
                 }
             }
 
             // 2. Breakout Pullback
-            if (!tradeSignal && previousPrice.close < previousEMA && latestPrice.close > latestEMA && latestVolume > volumeAvg * 1.5) {
-                if (latestPrice.high > previousPrice.high && latestPrice.close < latestPrice.high && latestRSI > 70 && isDiscount && isNearFibOrSession) {
-                    if (fvg || breakerBlock) {
-                        tradeSignal = 'buy';
-                    }
-                }
-            }
-
-            // 3. VWAP Bounce (using EMA as proxy)
-            if (!tradeSignal && Math.abs(latestPrice.close - latestEMA) < 0.5 && latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isDiscount && isNearFibOrSession) {
-                tradeSignal = 'buy';
-            }
-
-            // 4. Mean Reversion
-            if (!tradeSignal && latestRSI < 20 && latestVolume > volumeAvg * 2.0 && isDiscount && isNearFibOrSession) {
-                if (fvg || breakerBlock) {
+            if (!tradeSignal && previousPrice.close < previousEMA && latestPrice.close > latestEMA && latestVolume > volumeAvg * 1.2) {
+                if (latestPrice.high > previousPrice.high && latestPrice.close < latestPrice.high && latestRSI > 60 && isDiscount) {
                     tradeSignal = 'buy';
                 }
             }
 
+            // 3. VWAP Bounce (using EMA as proxy)
+            if (!tradeSignal && Math.abs(latestPrice.close - latestEMA) < 0.5 && latestRSI > 60 && latestVolume > volumeAvg * 1.2 && isDiscount) {
+                tradeSignal = 'buy';
+            }
+
+            // 4. Mean Reversion
+            if (!tradeSignal && latestRSI < 30 && latestVolume > volumeAvg * 1.5 && isDiscount) {
+                tradeSignal = 'buy';
+            }
+
             // 5. Order Block Break
-            if (!tradeSignal && breakerBlock && isDiscount && latestRSI > 70 && isNearFibOrSession) {
+            if (!tradeSignal && breakerBlock && isDiscount && latestRSI > 60) {
                 tradeSignal = 'buy';
             }
 
@@ -266,7 +272,7 @@ app.post('/api/backtest', async (req, res) => {
                 const stopLoss = latestPrice.close - 4;
                 const takeProfit = latestPrice.close + 4;
 
-                // Simulate trade outcome (for backtesting only)
+                // Simulate trade outcome
                 let profitLoss = 0;
                 let tradeClosed = false;
                 for (let j = i + 1; j < filteredCandles.length; j++) {
@@ -283,7 +289,6 @@ app.post('/api/backtest', async (req, res) => {
                 }
 
                 if (!tradeClosed) {
-                    // If trade doesn't close by the end of the data, calculate profit/loss based on the last candle
                     const lastCandle = filteredCandles[filteredCandles.length - 1];
                     profitLoss = (lastCandle.close - latestPrice.close) * units;
                 }
@@ -303,15 +308,18 @@ app.post('/api/backtest', async (req, res) => {
                     dailyLoss += Math.abs(profitLoss);
                 }
                 tradesToday++;
+                console.log(`Trade executed at ${candle.time}: Signal: ${tradeSignal}, Profit/Loss: $${profitLoss}`);
             }
         }
 
+        console.log(`Backtest completed: ${totalTrades} trades, Net Profit: $${netProfit}`);
         res.json({
             totalTrades: totalTrades,
             netProfit: netProfit,
             trades: trades,
         });
     } catch (error) {
+        console.error('Backtesting error:', error.message);
         res.status(500).json({ error: 'Backtesting error', details: error.message });
     }
 });
@@ -409,46 +417,42 @@ app.post('/api/start-trading', async (req, res) => {
             (sessionLow && Math.abs(latestPrice.close - sessionLow) < latestATR)
         );
 
-        // Entry Conditions
+        // Entry Conditions (Simplified for real-time trading)
         let tradeSignal = null;
 
         // 1. Opening Range Breakout (9:45 AM)
         if (hours === 9 && minutes === 45) {
-            const rangeCandles = candles.slice(Math.max(0, candles.length - 4), candles.length - 1); // Last 3 candles
+            const rangeCandles = candles.slice(Math.max(0, candles.length - 4), candles.length - 1);
             const rangeHigh = Math.max(...rangeCandles.map(c => c.high));
-            if (latestPrice.close > rangeHigh && latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isDiscount && isNearFibOrSession) {
+            if (latestPrice.close > rangeHigh && latestRSI > 60 && latestVolume > volumeAvg * 1.2 && isDiscount) {
                 tradeSignal = 'buy';
             }
         }
 
         // 2. Breakout Pullback
-        if (!tradeSignal && previousPrice.close < previousEMA && latestPrice.close > latestEMA && latestVolume > volumeAvg * 1.5) {
-            if (latestPrice.high > previousPrice.high && latestPrice.close < latestPrice.high && latestRSI > 70 && isDiscount && isNearFibOrSession) {
-                if (fvg || breakerBlock) {
-                    tradeSignal = 'buy';
-                }
-            }
-        }
-
-        // 3. VWAP Bounce (using EMA as proxy)
-        if (!tradeSignal && Math.abs(latestPrice.close - latestEMA) < 0.5 && latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isDiscount && isNearFibOrSession) {
-            tradeSignal = 'buy';
-        }
-
-        // 4. Mean Reversion
-        if (!tradeSignal && latestRSI < 20 && latestVolume > volumeAvg * 2.0 && isDiscount && isNearFibOrSession) {
-            if (fvg || breakerBlock) {
+        if (!tradeSignal && previousPrice.close < previousEMA && latestPrice.close > latestEMA && latestVolume > volumeAvg * 1.2) {
+            if (latestPrice.high > previousPrice.high && latestPrice.close < latestPrice.high && latestRSI > 60 && isDiscount) {
                 tradeSignal = 'buy';
             }
         }
 
+        // 3. VWAP Bounce (using EMA as proxy)
+        if (!tradeSignal && Math.abs(latestPrice.close - latestEMA) < 0.5 && latestRSI > 60 && latestVolume > volumeAvg * 1.2 && isDiscount) {
+            tradeSignal = 'buy';
+        }
+
+        // 4. Mean Reversion
+        if (!tradeSignal && latestRSI < 30 && latestVolume > volumeAvg * 1.5 && isDiscount) {
+            tradeSignal = 'buy';
+        }
+
         // 5. Order Block Break
-        if (!tradeSignal && breakerBlock && isDiscount && latestRSI > 70 && isNearFibOrSession) {
+        if (!tradeSignal && breakerBlock && isDiscount && latestRSI > 60) {
             tradeSignal = 'buy';
         }
 
         if (tradeSignal === 'buy') {
-            const units = Math.floor(riskPerTrade / 2); // $2 stop loss per unit
+            const units = Math.floor(riskPerTrade / 2);
             const stopLoss = latestPrice.close - 4;
             const takeProfit = latestPrice.close + 4;
             tradesToday++;
@@ -457,6 +461,7 @@ app.post('/api/start-trading', async (req, res) => {
             res.json({ message: 'No trade signal', timestamp: latestPrice.time });
         }
     } catch (error) {
+        console.error('Trading error:', error.message);
         res.status(500).json({ error: 'Trading error', details: error.message });
     }
 });
