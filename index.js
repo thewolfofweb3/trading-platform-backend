@@ -16,6 +16,7 @@ let dailyLoss = 0;
 const dailyLossCap = 4500; // 3% of 150K
 const riskPerTrade = 900; // 0.6% of 150K
 let tradesToday = 0;
+let lastDay = null;
 
 // Default route for root URL
 app.get('/', (req, res) => {
@@ -149,7 +150,120 @@ app.post('/api/backtest', async (req, res) => {
                 continue;
             }
 
-            // Use only candles up to the current index for indicators (no look-ahead)
+            // Check daily trade limit
+            if (tradesToday >= 5) {
+                // Only allow golden trades after 5 trades
+                let isGoldenTrade = false;
+
+                // Use candles up to the current index for indicators (no look-ahead)
+                const prices = filteredCandles.slice(0, i + 1);
+                const closes = prices.map(p => p.close);
+                const highs = prices.map(p => p.high);
+                const lows = prices.map(p => p.low);
+                const ema20 = EMA.calculate({ period: 20, values: closes });
+                const rsi9 = RSI.calculate({ period: 9, values: closes });
+                const atr14 = ATR.calculate({ high: highs, low: lows, close: closes, period: 14 });
+                const volumes = prices.map(p => p.volume);
+                const volumeAvg = volumes.slice(-Math.min(10, volumes.length)).reduce((a, b) => a + b, 0) / Math.min(10, volumes.length);
+
+                if (ema20.length < 20 || rsi9.length < 9 || atr14.length < 14) {
+                    console.log(`Skipping candle at ${candle.time}: insufficient data for indicators`);
+                    continue;
+                }
+
+                const latestPrice = prices[prices.length - 1];
+                const previousPrice = prices[prices.length - 2] || latestPrice;
+                const latestEMA = ema20[ema20.length - 1];
+                const previousEMA = ema20[ema20.length - 2] || latestEMA;
+                const latestRSI = rsi9[rsi9.length - 1];
+                const latestVolume = latestPrice.volume;
+                const latestATR = atr14[atr14.length - 1];
+
+                // Calculate session highs and lows (9:45 AM - 3:30 PM ET)
+                const sessionStartHour = 9;
+                const sessionStartMinute = 45;
+                const sessionEndHour = 15;
+                const sessionEndMinute = 30;
+                const sessionCandles = prices.filter(candle => {
+                    const hours = candle.time.getUTCHours() - 4;
+                    const minutes = candle.time.getUTCMinutes();
+                    return (hours > sessionStartHour || (hours === sessionStartHour && minutes >= sessionStartMinute)) &&
+                           (hours < sessionEndHour || (hours === sessionEndHour && minutes <= sessionEndMinute));
+                });
+
+                const sessionHigh = sessionCandles.length > 0 ? Math.max(...sessionCandles.map(c => c.high)) : null;
+                const sessionLow = sessionCandles.length > 0 ? Math.min(...sessionCandles.map(c => c.low)) : null;
+
+                // Calculate Fibonacci levels
+                const fibLevels = sessionHigh && sessionLow ? {
+                    high: sessionHigh,
+                    low: sessionLow,
+                    fib_0: sessionHigh,
+                    fib_236: sessionHigh - (sessionHigh - sessionLow) * 0.236,
+                    fib_382: sessionHigh - (sessionHigh - sessionLow) * 0.382,
+                    fib_500: sessionHigh - (sessionHigh - sessionLow) * 0.500,
+                    fib_618: sessionHigh - (sessionHigh - sessionLow) * 0.618,
+                    fib_100: sessionLow,
+                } : null;
+
+                // PD Arrays (Premium/Discount Zones)
+                const fairValue = latestEMA;
+                const premiumZone = fairValue + latestATR;
+                const discountZone = fairValue - latestATR;
+                const isDiscount = latestPrice.close < discountZone;
+                const isPremium = latestPrice.close > premiumZone;
+
+                // FVG Detection
+                let fvgBullish = false;
+                let fvgBearish = false;
+                if (previousPrice.high < latestPrice.low) {
+                    fvgBullish = true;
+                }
+                if (previousPrice.low > latestPrice.high) {
+                    fvgBearish = true;
+                }
+
+                // Breaker Block Detection
+                let breakerBlockBullish = false;
+                let breakerBlockBearish = false;
+                const bigMoveIndexUp = prices.slice(0, -1).findIndex((p, j) => Math.abs(p.close - prices[j + 1].close) > 50 && p.close < prices[j + 1].close);
+                const bigMoveIndexDown = prices.slice(0, -1).findIndex((p, j) => Math.abs(p.close - prices[j + 1].close) > 50 && p.close > prices[j + 1].close);
+                if (bigMoveIndexUp !== -1) {
+                    const orderBlockHigh = prices[bigMoveIndexUp].high;
+                    if (latestPrice.high > orderBlockHigh && latestPrice.close < orderBlockHigh && latestVolume > volumeAvg * 1.2) {
+                        breakerBlockBullish = true;
+                    }
+                }
+                if (bigMoveIndexDown !== -1) {
+                    const orderBlockLow = prices[bigMoveIndexDown].low;
+                    if (latestPrice.low < orderBlockLow && latestPrice.close > orderBlockLow && latestVolume > volumeAvg * 1.2) {
+                        breakerBlockBearish = true;
+                    }
+                }
+
+                // Confluence: Price Near Fibonacci or Session Levels
+                const isNearFibOrSession = fibLevels && (
+                    Math.abs(latestPrice.close - fibLevels.fib_236) < latestATR ||
+                    Math.abs(latestPrice.close - fibLevels.fib_382) < latestATR ||
+                    Math.abs(latestPrice.close - fibLevels.fib_500) < latestATR ||
+                    Math.abs(latestPrice.close - fibLevels.fib_618) < latestATR ||
+                    (sessionHigh && Math.abs(latestPrice.close - sessionHigh) < latestATR) ||
+                    (sessionLow && Math.abs(latestPrice.close - sessionLow) < latestATR)
+                );
+
+                // Golden Trade Conditions
+                if (latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isNearFibOrSession && (fvgBullish || breakerBlockBullish)) {
+                    isGoldenTrade = true; // Golden Buy
+                } else if (latestRSI < 30 && latestVolume > volumeAvg * 1.5 && isNearFibOrSession && (fvgBearish || breakerBlockBearish)) {
+                    isGoldenTrade = true; // Golden Sell
+                }
+
+                if (!isGoldenTrade) {
+                    continue; // Skip if not a golden trade after 5 trades
+                }
+            }
+
+            // Use candles up to the current index for indicators (no look-ahead)
             const prices = filteredCandles.slice(0, i + 1);
             const closes = prices.map(p => p.close);
             const highs = prices.map(p => p.high);
@@ -205,20 +319,33 @@ app.post('/api/backtest', async (req, res) => {
             const premiumZone = fairValue + latestATR;
             const discountZone = fairValue - latestATR;
             const isDiscount = latestPrice.close < discountZone;
+            const isPremium = latestPrice.close > premiumZone;
 
             // FVG Detection
-            let fvg = false;
+            let fvgBullish = false;
+            let fvgBearish = false;
             if (previousPrice.high < latestPrice.low) {
-                fvg = true;
+                fvgBullish = true;
+            }
+            if (previousPrice.low > latestPrice.high) {
+                fvgBearish = true;
             }
 
             // Breaker Block Detection
-            let breakerBlock = false;
-            const bigMoveIndex = prices.slice(0, -1).findIndex((p, j) => Math.abs(p.close - prices[j + 1].close) > 50);
-            if (bigMoveIndex !== -1) {
-                const orderBlockHigh = prices[bigMoveIndex].high;
+            let breakerBlockBullish = false;
+            let breakerBlockBearish = false;
+            const bigMoveIndexUp = prices.slice(0, -1).findIndex((p, j) => Math.abs(p.close - prices[j + 1].close) > 50 && p.close < prices[j + 1].close);
+            const bigMoveIndexDown = prices.slice(0, -1).findIndex((p, j) => Math.abs(p.close - prices[j + 1].close) > 50 && p.close > prices[j + 1].close);
+            if (bigMoveIndexUp !== -1) {
+                const orderBlockHigh = prices[bigMoveIndexUp].high;
                 if (latestPrice.high > orderBlockHigh && latestPrice.close < orderBlockHigh && latestVolume > volumeAvg * 1.2) {
-                    breakerBlock = true;
+                    breakerBlockBullish = true;
+                }
+            }
+            if (bigMoveIndexDown !== -1) {
+                const orderBlockLow = prices[bigMoveIndexDown].low;
+                if (latestPrice.low < orderBlockLow && latestPrice.close > orderBlockLow && latestVolume > volumeAvg * 1.2) {
+                    breakerBlockBearish = true;
                 }
             }
 
@@ -232,67 +359,96 @@ app.post('/api/backtest', async (req, res) => {
                 (sessionLow && Math.abs(latestPrice.close - sessionLow) < latestATR)
             );
 
-            // Entry Conditions (Simplified and adjusted for backtesting)
+            // Entry Conditions (Adjusted for frequency and long/short trades)
             let tradeSignal = null;
 
             // 1. Opening Range Breakout (9:45 AM)
             if (hours === 9 && minutes === 45) {
                 const rangeCandles = prices.slice(Math.max(0, i - 3), i + 1);
                 const rangeHigh = Math.max(...rangeCandles.map(c => c.high));
+                const rangeLow = Math.min(...rangeCandles.map(c => c.low));
                 if (latestPrice.close > rangeHigh && latestRSI > 60 && latestVolume > volumeAvg * 1.2 && isDiscount) {
                     tradeSignal = 'buy';
+                } else if (latestPrice.close < rangeLow && latestRSI < 40 && latestVolume > volumeAvg * 1.2 && isPremium) {
+                    tradeSignal = 'sell';
                 }
             }
 
             // 2. Breakout Pullback
-            if (!tradeSignal && previousPrice.close < previousEMA && latestPrice.close > latestEMA && latestVolume > volumeAvg * 1.2) {
-                if (latestPrice.high > previousPrice.high && latestPrice.close < latestPrice.high && latestRSI > 60 && isDiscount) {
+            if (!tradeSignal) {
+                if (previousPrice.close < previousEMA && latestPrice.close > latestEMA && latestVolume > volumeAvg * 1.2 && latestRSI > 60 && isDiscount) {
                     tradeSignal = 'buy';
+                } else if (previousPrice.close > previousEMA && latestPrice.close < latestEMA && latestVolume > volumeAvg * 1.2 && latestRSI < 40 && isPremium) {
+                    tradeSignal = 'sell';
                 }
             }
 
             // 3. VWAP Bounce (using EMA as proxy)
-            if (!tradeSignal && Math.abs(latestPrice.close - latestEMA) < 0.5 && latestRSI > 60 && latestVolume > volumeAvg * 1.2 && isDiscount) {
-                tradeSignal = 'buy';
+            if (!tradeSignal) {
+                if (Math.abs(latestPrice.close - latestEMA) < 0.5 && latestRSI > 60 && latestVolume > volumeAvg * 1.2 && isDiscount) {
+                    tradeSignal = 'buy';
+                } else if (Math.abs(latestPrice.close - latestEMA) < 0.5 && latestRSI < 40 && latestVolume > volumeAvg * 1.2 && isPremium) {
+                    tradeSignal = 'sell';
+                }
             }
 
             // 4. Mean Reversion
-            if (!tradeSignal && latestRSI < 30 && latestVolume > volumeAvg * 1.5 && isDiscount) {
-                tradeSignal = 'buy';
+            if (!tradeSignal) {
+                if (latestRSI < 30 && latestVolume > volumeAvg * 1.5 && isDiscount) {
+                    tradeSignal = 'buy';
+                } else if (latestRSI > 70 && latestVolume > volumeAvg * 1.5 && isPremium) {
+                    tradeSignal = 'sell';
+                }
             }
 
             // 5. Order Block Break
-            if (!tradeSignal && breakerBlock && isDiscount && latestRSI > 60) {
-                tradeSignal = 'buy';
+            if (!tradeSignal) {
+                if (breakerBlockBullish && isDiscount && latestRSI > 60) {
+                    tradeSignal = 'buy';
+                } else if (breakerBlockBearish && isPremium && latestRSI < 40) {
+                    tradeSignal = 'sell';
+                }
             }
 
             // Simulate trade execution
-            if (tradeSignal === 'buy') {
+            if (tradeSignal) {
                 const units = Math.floor(riskPerTrade / 4); // $900 / 4 points = 225 units
                 const entryPrice = latestPrice.close;
-                const stopLoss = entryPrice - 4;
-                const takeProfit = entryPrice + 4;
+                const stopLoss = tradeSignal === 'buy' ? entryPrice - 4 : entryPrice + 4;
+                const takeProfit = tradeSignal === 'buy' ? entryPrice + 8 : entryPrice - 8; // 2:1 risk-reward
 
                 // Simulate trade outcome
                 let profitLoss = 0;
                 let tradeClosed = false;
                 for (let j = i + 1; j < filteredCandles.length; j++) {
                     const futureCandle = filteredCandles[j];
-                    if (futureCandle.low <= stopLoss) {
-                        profitLoss = -4 * units; // Loss capped at $900
-                        tradeClosed = true;
-                        break;
-                    } else if (futureCandle.high >= takeProfit) {
-                        profitLoss = 4 * units; // Profit at $900
-                        tradeClosed = true;
-                        break;
+                    if (tradeSignal === 'buy') {
+                        if (futureCandle.low <= stopLoss) {
+                            profitLoss = -4 * units; // Loss capped at $900
+                            tradeClosed = true;
+                            break;
+                        } else if (futureCandle.high >= takeProfit) {
+                            profitLoss = 8 * units; // Win at $1800
+                            tradeClosed = true;
+                            break;
+                        }
+                    } else {
+                        if (futureCandle.high >= stopLoss) {
+                            profitLoss = -4 * units; // Loss capped at $900
+                            tradeClosed = true;
+                            break;
+                        } else if (futureCandle.low <= takeProfit) {
+                            profitLoss = 8 * units; // Win at $1800
+                            tradeClosed = true;
+                            break;
+                        }
                     }
                 }
 
                 if (!tradeClosed) {
                     const lastCandle = filteredCandles[filteredCandles.length - 1];
-                    profitLoss = (lastCandle.close - entryPrice) * units;
-                    profitLoss = Math.max(Math.min(profitLoss, 4 * units), -4 * units); // Cap at $900 profit/loss
+                    profitLoss = tradeSignal === 'buy' ? (lastCandle.close - entryPrice) * units : (entryPrice - lastCandle.close) * units;
+                    profitLoss = tradeSignal === 'buy' ? Math.max(Math.min(profitLoss, 8 * units), -4 * units) : Math.max(Math.min(profitLoss, 8 * units), -4 * units);
                 }
 
                 trades.push({
@@ -381,94 +537,16 @@ app.post('/api/start-trading', async (req, res) => {
         // Check time window (9:45 AM - 11:30 AM ET and 1:30 PM - 3:30 PM ET)
         const hours = latestPrice.time.getUTCHours() - 4;
         const minutes = latestPrice.time.getUTCMinutes();
+        const currentDay = latestPrice.time.toISOString().split('T')[0];
         const isTradingWindow = (hours === 9 && minutes >= 45) || (hours === 10) || (hours === 11 && minutes <= 30) ||
                                (hours === 13 && minutes >= 30) || (hours === 14) || (hours === 15 && minutes <= 30);
 
+        // Reset daily stats if new day
+        if (lastDay && lastDay !== currentDay) {
+            dailyLoss = 0;
+            tradesToday = 0;
+        }
+        lastDay = currentDay;
+
         if (!isTradingWindow || dailyLoss >= dailyLossCap) {
-            return res.json({ message: 'Outside trading window or daily loss cap reached', timestamp: latestPrice.time });
-        }
-
-        // PD Arrays (Premium/Discount Zones)
-        const fairValue = latestEMA;
-        const premiumZone = fairValue + latestATR;
-        const discountZone = fairValue - latestATR;
-        const isDiscount = latestPrice.close < discountZone;
-
-        // FVG Detection
-        let fvg = false;
-        if (previousPrice.high < latestPrice.low) {
-            fvg = true;
-        }
-
-        // Breaker Block Detection
-        let breakerBlock = false;
-        const bigMoveIndex = candles.slice(0, -1).findIndex((p, j) => Math.abs(p.close - candles[j + 1].close) > 50);
-        if (bigMoveIndex !== -1) {
-            const orderBlockHigh = candles[bigMoveIndex].high;
-            if (latestPrice.high > orderBlockHigh && latestPrice.close < orderBlockHigh && latestVolume > volumeAvg * 1.2) {
-                breakerBlock = true;
-            }
-        }
-
-        // Confluence: Price Near Fibonacci or Session Levels
-        const isNearFibOrSession = fibLevels && (
-            Math.abs(latestPrice.close - fibLevels.fib_236) < latestATR ||
-            Math.abs(latestPrice.close - fibLevels.fib_382) < latestATR ||
-            Math.abs(latestPrice.close - fibLevels.fib_500) < latestATR ||
-            Math.abs(latestPrice.close - fibLevels.fib_618) < latestATR ||
-            (sessionHigh && Math.abs(latestPrice.close - sessionHigh) < latestATR) ||
-            (sessionLow && Math.abs(latestPrice.close - sessionLow) < latestATR)
-        );
-
-        // Entry Conditions
-        let tradeSignal = null;
-
-        // 1. Opening Range Breakout (9:45 AM)
-        if (hours === 9 && minutes === 45) {
-            const rangeCandles = candles.slice(Math.max(0, candles.length - 4), candles.length - 1);
-            const rangeHigh = Math.max(...rangeCandles.map(c => c.high));
-            if (latestPrice.close > rangeHigh && latestRSI > 60 && latestVolume > volumeAvg * 1.2 && isDiscount) {
-                tradeSignal = 'buy';
-            }
-        }
-
-        // 2. Breakout Pullback
-        if (!tradeSignal && previousPrice.close < previousEMA && latestPrice.close > latestEMA && latestVolume > volumeAvg * 1.2) {
-            if (latestPrice.high > previousPrice.high && latestPrice.close < latestPrice.high && latestRSI > 60 && isDiscount) {
-                tradeSignal = 'buy';
-            }
-        }
-
-        // 3. VWAP Bounce (using EMA as proxy)
-        if (!tradeSignal && Math.abs(latestPrice.close - latestEMA) < 0.5 && latestRSI > 60 && latestVolume > volumeAvg * 1.2 && isDiscount) {
-            tradeSignal = 'buy';
-        }
-
-        // 4. Mean Reversion
-        if (!tradeSignal && latestRSI < 30 && latestVolume > volumeAvg * 1.5 && isDiscount) {
-            tradeSignal = 'buy';
-        }
-
-        // 5. Order Block Break
-        if (!tradeSignal && breakerBlock && isDiscount && latestRSI > 60) {
-            tradeSignal = 'buy';
-        }
-
-        if (tradeSignal === 'buy') {
-            const units = Math.floor(riskPerTrade / 4); // $900 / 4 points = 225 units
-            const entryPrice = latestPrice.close;
-            const stopLoss = entryPrice - 4;
-            const takeProfit = entryPrice + 4;
-            tradesToday++;
-            res.json({ message: 'Trade executed', signal: tradeSignal, entryPrice, units, stopLoss, takeProfit, timestamp: latestPrice.time });
-        } else {
-            res.json({ message: 'No trade signal', timestamp: latestPrice.time });
-        }
-    } catch (error) {
-        console.error('Trading error:', error.message);
-        res.status(500).json({ error: 'Trading error', details: error.message });
-    }
-});
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+            return res.json({ message: 'Outside trading window or daily loss cap reached', timestamp: lates
