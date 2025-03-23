@@ -2,9 +2,10 @@ const axios = require('axios');
 const { ML } = require('ml-js');
 
 // Polygon API key (replace with your key)
-const POLYGON_API_KEY = Pq2TNELGWQpjDQh8EByJmfNIhtFu6AP4
+const POLYGON_API_KEY = 'YOUR_POLYGON_API_KEY';
 let tradeLog = [];
 let paperTradeLog = [];
+let backtestTradeLog = [];
 let accountBalance = 150000; // Starting balance
 let dailyProfit = 0;
 let dailyLoss = 0;
@@ -39,8 +40,9 @@ module.exports = async (req, res) => {
             });
         } else if (req.url === '/api/backtest') {
             const { instrument, strategy, date } = req.body;
+            backtestTradeLog = []; // Reset backtest log
             const trades = await executeICTStrategy(instrument, true, date);
-            tradeLog.push(...trades);
+            backtestTradeLog.push(...trades);
             const totalTrades = trades.length;
             const wins = trades.filter(t => t.profitLoss > 0).length;
             const winRate = (wins / totalTrades * 100).toFixed(2);
@@ -53,16 +55,20 @@ module.exports = async (req, res) => {
             const { broker, apiKey, accountId } = req.body;
             const trades = await executeICTStrategy('MES1', false, null, true);
             paperTradeLog.push(...trades);
-            res.json({ status: 'Paper Trading Active' });
+            const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0);
+            res.json({ status: 'Paper Trading Active', netProfit });
         } else if (req.url === '/api/paper-backtest') {
             const { broker, apiKey, accountId } = req.body;
             const trades = await executeICTStrategy('MES1', true, '2024-10-01', true);
             paperTradeLog.push(...trades);
-            res.json({ status: 'Paper Backtest Complete' });
+            const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0);
+            res.json({ status: 'Paper Backtest Complete', netProfit });
         }
     } else if (req.method === 'GET') {
         if (req.url === '/api/trade-log') {
             res.json(tradeLog);
+        } else if (req.url === '/api/backtest-trade-log') {
+            res.json(backtestTradeLog);
         } else if (req.url === '/api/paper-trade-log') {
             res.json(paperTradeLog);
         } else if (req.url === '/api/market-data') {
@@ -80,15 +86,19 @@ async function fetchMarketData() {
             `https://api.polygon.io/v2/aggs/ticker/FUTURES:${symbol}/range/5/minute/${date}/${date}?apiKey=${POLYGON_API_KEY}`
         );
         const bars = response.data.results || [];
-        const labels = bars.map(bar => new Date(bar.t).toLocaleTimeString());
-        const highs = bars.map(bar => bar.h);
-        const lows = bars.map(bar => bar.l);
+        const candles = bars.map(bar => ({
+            t: bar.t,
+            open: bar.o,
+            high: bar.h,
+            low: bar.l,
+            close: bar.c
+        }));
         const volume = bars.reduce((sum, bar) => sum + bar.v, 0);
         const dailyChange = bars.length > 1 ? ((bars[bars.length - 1].c - bars[0].o) / bars[0].o * 100).toFixed(2) : 0;
-        return { labels, highs, lows, volume, dailyChange };
+        return { candles, volume, dailyChange };
     } catch (error) {
         console.error('Error fetching market data:', error);
-        return { labels: [], highs: [], lows: [], volume: 0, dailyChange: 0 };
+        return { candles: [], volume: 0, dailyChange: 0 };
     }
 }
 
@@ -110,9 +120,11 @@ async function executeICTStrategy(instrument, isBacktest = false, date = null, i
         const rsi = calculateRSI(data.slice(0, i), 9);
         
         // Order Block: Last consolidation before a big move
+        let orderBlockReason = '';
         if (Math.abs(bar.close - prevBar.close) > bar.atr * 2) {
             lastOrderBlockHigh = prevBar.high;
             lastOrderBlockLow = prevBar.low;
+            orderBlockReason = 'Order block identified: Consolidation before big move';
         }
         
         // Liquidity Channel: Zone between prior high/low and VWAP
@@ -120,13 +132,22 @@ async function executeICTStrategy(instrument, isBacktest = false, date = null, i
         liquidityChannelLow = Math.min(data[i - 2]?.low || bar.low, vwap);
         
         // Liquidity Sweep: Price hits prior high/low or channel boundary then reverses
+        let sweepReason = '';
         const isSweep = (bar.high >= liquidityChannelHigh && bar.close < bar.open) || 
                         (bar.low <= liquidityChannelLow && bar.close > bar.open);
+        if (isSweep) {
+            sweepReason = `Liquidity sweep: Price hit ${bar.high >= liquidityChannelHigh ? 'channel high' : 'channel low'} and reversed`;
+        }
         
         // FVG: Price gap with no overlap
+        let fvgReason = '';
         const isFVG = bar.high < prevBar.low || bar.low > prevBar.high;
+        if (isFVG) {
+            fvgReason = 'Fair value gap detected: Price gap with no overlap';
+        }
         
         // Entry: Retest of order block after sweep, with FVG confirmation
+        let rsiReason = `RSI: ${rsi.toFixed(2)}`;
         const isBuy = isSweep && bar.low <= lastOrderBlockHigh && bar.close > lastOrderBlockHigh && rsi > 50 && rsi < 70 && isFVG;
         const isSell = isSweep && bar.high >= lastOrderBlockLow && bar.close < lastOrderBlockLow && rsi < 50 && rsi > 30 && isFVG;
         
@@ -142,13 +163,15 @@ async function executeICTStrategy(instrument, isBacktest = false, date = null, i
             if (Math.random() < 0.25) exitPrice = stopLoss; // 25% loss rate
             const profitLoss = (exitPrice - entryPrice) * (isBuy ? 5 : -5) * contracts; // MES tick value × contracts
             
+            const reason = `${sweepReason}; ${orderBlockReason}; ${fvgReason}; ${rsiReason}`;
             const trade = {
                 timestamp: new Date(bar.t).toISOString(),
                 instrument,
                 signal: isBuy ? 'BUY' : 'SELL',
                 entryPrice: entryPrice.toFixed(2),
                 exitPrice: exitPrice.toFixed(2),
-                profitLoss: profitLoss.toFixed(2)
+                profitLoss: profitLoss.toFixed(2),
+                reason
             };
             trades.push(trade);
             
