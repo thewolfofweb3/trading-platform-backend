@@ -2,7 +2,7 @@ const axios = require('axios');
 const { ML } = require('ml-js');
 
 // Polygon API key (replace with your key)
-const POLYGON_API_KEY = 'Pq2TNELGWQpjDQh8EByJmfNIhtFu6AP4'
+const POLYGON_API_KEY = 'YOUR_POLYGON_API_KEY';
 let tradeLog = [];
 let paperTradeLog = [];
 let accountBalance = 150000; // Starting balance
@@ -75,16 +75,21 @@ module.exports = async (req, res) => {
 async function fetchMarketData() {
     const symbol = 'MES1';
     const date = new Date().toISOString().split('T')[0];
-    const response = await axios.get(
-        `https://api.polygon.io/v2/aggs/ticker/FUTURES:${symbol}/range/5/minute/${date}/${date}?apiKey=${POLYGON_API_KEY}`
-    );
-    const bars = response.data.results || [];
-    const labels = bars.map(bar => new Date(bar.t).toLocaleTimeString());
-    const highs = bars.map(bar => bar.h);
-    const lows = bars.map(bar => bar.l);
-    const volume = bars.reduce((sum, bar) => sum + bar.v, 0);
-    const dailyChange = ((bars[bars.length - 1]?.c - bars[0]?.o) / bars[0]?.o * 100).toFixed(2);
-    return { labels, highs, lows, volume, dailyChange };
+    try {
+        const response = await axios.get(
+            `https://api.polygon.io/v2/aggs/ticker/FUTURES:${symbol}/range/5/minute/${date}/${date}?apiKey=${POLYGON_API_KEY}`
+        );
+        const bars = response.data.results || [];
+        const labels = bars.map(bar => new Date(bar.t).toLocaleTimeString());
+        const highs = bars.map(bar => bar.h);
+        const lows = bars.map(bar => bar.l);
+        const volume = bars.reduce((sum, bar) => sum + bar.v, 0);
+        const dailyChange = bars.length > 1 ? ((bars[bars.length - 1].c - bars[0].o) / bars[0].o * 100).toFixed(2) : 0;
+        return { labels, highs, lows, volume, dailyChange };
+    } catch (error) {
+        console.error('Error fetching market data:', error);
+        return { labels: [], highs: [], lows: [], volume: 0, dailyChange: 0 };
+    }
 }
 
 async function executeICTStrategy(instrument, isBacktest = false, date = null, isPaper = false) {
@@ -161,19 +166,24 @@ async function executeICTStrategy(instrument, isBacktest = false, date = null, i
 }
 
 async function fetchHistoricalData(symbol, date) {
-    const response = await axios.get(
-        `https://api.polygon.io/v2/aggs/ticker/FUTURES:${symbol}/range/5/minute/${date}/${date}?apiKey=${POLYGON_API_KEY}`
-    );
-    const bars = response.data.results || [];
-    return bars.map(bar => ({
-        t: bar.t,
-        open: bar.o,
-        high: bar.h,
-        low: bar.l,
-        close: bar.c,
-        volume: bar.v,
-        atr: calculateATR(bars, 14)
-    }));
+    try {
+        const response = await axios.get(
+            `https://api.polygon.io/v2/aggs/ticker/FUTURES:${symbol}/range/5/minute/${date}/${date}?apiKey=${POLYGON_API_KEY}`
+        );
+        const bars = response.data.results || [];
+        return bars.map(bar => ({
+            t: bar.t,
+            open: bar.o,
+            high: bar.h,
+            low: bar.l,
+            close: bar.c,
+            volume: bar.v,
+            atr: calculateATR(bars, 14)
+        }));
+    } catch (error) {
+        console.error('Error fetching historical data:', error);
+        return [];
+    }
 }
 
 function calculateRSI(data, period) {
