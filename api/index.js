@@ -41,12 +41,16 @@ module.exports = async (req, res) => {
     }
 
     try {
+        // Normalize the URL by removing query parameters and trailing slashes
+        const urlPath = req.url.split('?')[0].replace(/\/+$/, '');
+        console.log(`Normalized URL path: ${urlPath}`);
+
         // Simplified route matching
-        if (req.url === '/api/market-data' && req.method === 'GET') {
+        if (urlPath === '/api/market-data' && req.method === 'GET') {
             console.log('Handling /api/market-data');
             const data = await fetchMarketData();
             res.json(data);
-        } else if (req.url === '/api/backtest' && req.method === 'POST') {
+        } else if (urlPath === '/api/backtest' && req.method === 'POST') {
             console.log('Handling /api/backtest');
             const { instrument, strategy, date } = req.body || {};
             console.log('Backtest request body:', { instrument, strategy, date });
@@ -67,7 +71,7 @@ module.exports = async (req, res) => {
             const response = { totalTrades, winRate, netProfit, profitFactor };
             console.log('Backtest response:', response);
             res.json(response);
-        } else if (req.url === '/api/start-trading' && req.method === 'POST') {
+        } else if (urlPath === '/api/start-trading' && req.method === 'POST') {
             console.log('Handling /api/start-trading');
             const trades = await executeICTStrategy('MES1');
             tradeLog.push(...trades);
@@ -85,31 +89,31 @@ module.exports = async (req, res) => {
                 wins: tradeLog.filter(t => t.profitLoss > 0).length,
                 losses: tradeLog.filter(t => t.profitLoss < 0).length
             });
-        } else if (req.url === '/api/paper-trade' && req.method === 'POST') {
+        } else if (urlPath === '/api/paper-trade' && req.method === 'POST') {
             console.log('Handling /api/paper-trade');
             const { broker, apiKey, accountId } = req.body || {};
             const trades = await executeICTStrategy('MES1', false, null, true);
             paperTradeLog.push(...trades);
             const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
             res.json({ status: 'Paper Trading Active', netProfit });
-        } else if (req.url === '/api/paper-backtest' && req.method === 'POST') {
+        } else if (urlPath === '/api/paper-backtest' && req.method === 'POST') {
             console.log('Handling /api/paper-backtest');
             const { broker, apiKey, accountId } = req.body || {};
             const trades = await executeICTStrategy('MES1', true, '2024-10-01', true);
             paperTradeLog.push(...trades);
             const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
             res.json({ status: 'Paper Backtest Complete', netProfit });
-        } else if (req.url === '/api/trade-log' && req.method === 'GET') {
+        } else if (urlPath === '/api/trade-log' && req.method === 'GET') {
             console.log('Handling /api/trade-log');
             res.json(tradeLog);
-        } else if (req.url === '/api/backtest-trade-log' && req.method === 'GET') {
+        } else if (urlPath === '/api/backtest-trade-log' && req.method === 'GET') {
             console.log('Handling /api/backtest-trade-log');
             res.json(backtestTradeLog);
-        } else if (req.url === '/api/paper-trade-log' && req.method === 'GET') {
+        } else if (urlPath === '/api/paper-trade-log' && req.method === 'GET') {
             console.log('Handling /api/paper-trade-log');
             res.json(paperTradeLog);
         } else {
-            console.log(`No matching route for ${req.method} ${req.url}`);
+            console.log(`No matching route for ${req.method} ${urlPath}`);
             res.status(404).json({ error: 'Not found' });
         }
     } catch (error) {
@@ -240,27 +244,6 @@ async function executeICTStrategy(instrument, isBacktest = false, date = null, i
         console.error('Error in executeICTStrategy:', error);
     }
     return trades;
-}
-
-async function fetchHistoricalData(symbol, date) {
-    try {
-        const response = await axios.get(
-            `https://api.polygon.io/v2/aggs/ticker/FUTURES:${symbol}/range/5/minute/${date}/${date}?apiKey=${POLYGON_API_KEY}`
-        );
-        const bars = response.data.results || [];
-        return bars.map(bar => ({
-            t: bar.t,
-            open: bar.o,
-            high: bar.h,
-            low: bar.l,
-            close: bar.c,
-            volume: bar.v,
-            atr: calculateATR(bars, 14)
-        }));
-    } catch (error) {
-        console.error('Error fetching historical data:', error.message);
-        return [];
-    }
 }
 
 function calculateRSI(data, period) {
