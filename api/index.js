@@ -2,7 +2,7 @@ const axios = require('axios');
 const { ML } = require('ml-js');
 
 // Polygon API key (replace with your key)
-const POLYGON_API_KEY = 'YOUR_POLYGON_API_KEY';
+const POLYGON_API_KEY = 'Pq2TNELGWQpjDQh8EByJmfNIhtFu6AP4'
 let tradeLog = [];
 let paperTradeLog = [];
 let accountBalance = 150000; // Starting balance
