@@ -31,9 +31,12 @@ module.exports = async (req, res) => {
     addCorsHeaders(res);
 
     if (req.method === 'OPTIONS') {
+        console.log('Handling OPTIONS request');
         res.status(200).end();
         return;
     }
+
+    console.log(`Received ${req.method} request to ${req.url}`);
 
     if (req.method === 'POST') {
         if (req.url === '/api/start-trading') {
@@ -61,6 +64,7 @@ module.exports = async (req, res) => {
         } else if (req.url === '/api/backtest') {
             try {
                 const { instrument, strategy, date } = req.body;
+                console.log('Backtest request body:', { instrument, strategy, date });
                 if (!instrument || !strategy || !date) {
                     res.status(400).json({ error: 'Missing required fields: instrument, strategy, or date' });
                     return;
@@ -75,7 +79,9 @@ module.exports = async (req, res) => {
                 const grossProfit = trades.filter(t => t.profitLoss > 0).reduce((sum, t) => sum + t.profitLoss, 0) || 0;
                 const grossLoss = trades.filter(t => t.profitLoss < 0).reduce((sum, t) => sum + t.profitLoss, 0) || 0;
                 const profitFactor = grossLoss !== 0 ? Math.abs(grossProfit / grossLoss).toFixed(2) : 0;
-                res.json({ totalTrades, winRate, netProfit, profitFactor });
+                const response = { totalTrades, winRate, netProfit, profitFactor };
+                console.log('Backtest response:', response);
+                res.json(response);
             } catch (error) {
                 console.error('Error in backtest:', error);
                 res.status(500).json({ error: 'Internal server error', details: error.message });
