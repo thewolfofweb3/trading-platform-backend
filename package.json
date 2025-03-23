@@ -4,6 +4,7 @@
     "description": "Backend for Futures AI Trading",
     "dependencies": {
         "axios": "^1.6.0",
+        "cors": "^2.8.5",
         "ml-js": "^6.0.0"
     },
     "vercel": {
