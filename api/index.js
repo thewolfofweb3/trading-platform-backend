@@ -19,22 +19,22 @@ const contracts = 20; // 20 MES contracts
 let model = new ML.Regression.SimpleLinearRegression();
 let trainingData = { inputs: [], outputs: [] };
 
-// Middleware to add CORS headers
-const addCorsHeaders = (res) => {
+// CORS middleware
+const corsMiddleware = (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-};
-
-module.exports = async (req, res) => {
-    // Add CORS headers
-    addCorsHeaders(res);
-
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     if (req.method === 'OPTIONS') {
         console.log('Handling OPTIONS request');
         res.status(200).end();
-        return;
+        return true;
     }
+    return false;
+};
+
+module.exports = async (req, res) => {
+    // Apply CORS middleware
+    if (corsMiddleware(req, res)) return;
 
     console.log(`Received ${req.method} request to ${req.url}`);
 
