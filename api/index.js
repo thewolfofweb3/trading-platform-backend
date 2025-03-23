@@ -19,6 +19,7 @@ const contracts = 20; // 20 MES contracts
 let model;
 try {
     model = new SimpleLinearRegression();
+    console.log('SimpleLinearRegression initialized successfully');
 } catch (error) {
     console.error('Error initializing SimpleLinearRegression:', error);
     model = null; // Fallback to null to prevent crashes
@@ -26,10 +27,12 @@ try {
 let trainingData = { inputs: [], outputs: [] };
 
 module.exports = async (req, res) => {
-    // Set CORS headers
+    // Set CORS headers for all responses
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    console.log(`Received request: ${req.method} ${req.url}`);
 
     if (req.method === 'OPTIONS') {
         console.log('Handling OPTIONS request');
@@ -37,77 +40,94 @@ module.exports = async (req, res) => {
         return;
     }
 
-    console.log(`Received ${req.method} request to ${req.url}`);
-
     try {
-        if (req.method === 'POST') {
-            if (req.url === '/api/start-trading') {
-                const trades = await executeICTStrategy('MES1');
-                tradeLog.push(...trades);
-                updateAccountStats(trades);
-                if (isEvaluation && dailyProfit >= profitTarget) {
-                    isEvaluation = false; // Pass evaluation
+        // Handle API routes
+        if (req.url.startsWith('/api/')) {
+            const endpoint = req.url.split('/api/')[1] || '';
+
+            if (req.method === 'POST') {
+                if (endpoint === 'start-trading') {
+                    console.log('Handling /api/start-trading');
+                    const trades = await executeICTStrategy('MES1');
+                    tradeLog.push(...trades);
+                    updateAccountStats(trades);
+                    if (isEvaluation && dailyProfit >= profitTarget) {
+                        isEvaluation = false; // Pass evaluation
+                    }
+                    if (!isEvaluation && (accountBalance < peakBalance - maxDrawdown)) {
+                        res.json({ status: 'Trading Stopped: Drawdown Limit Hit', profit: dailyProfit, wins: 0, losses: 0 });
+                        return;
+                    }
+                    res.json({
+                        status: dailyProfit >= profitTarget || dailyLoss >= maxDrawdown ? 'Trading Stopped' : 'Trading Active',
+                        profit: dailyProfit,
+                        wins: tradeLog.filter(t => t.profitLoss > 0).length,
+                        losses: tradeLog.filter(t => t.profitLoss < 0).length
+                    });
+                } else if (endpoint === 'backtest') {
+                    console.log('Handling /api/backtest');
+                    const { instrument, strategy, date } = req.body || {};
+                    console.log('Backtest request body:', { instrument, strategy, date });
+                    if (!instrument || !strategy || !date) {
+                        res.status(400).json({ error: 'Missing required fields: instrument, strategy, or date' });
+                        return;
+                    }
+                    backtestTradeLog = []; // Reset backtest log
+                    const trades = await executeICTStrategy(instrument, true, date);
+                    backtestTradeLog.push(...trades);
+                    const totalTrades = trades.length;
+                    const wins = trades.filter(t => t.profitLoss > 0).length;
+                    const winRate = totalTrades > 0 ? (wins / totalTrades * 100).toFixed(2) : 0;
+                    const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
+                    const grossProfit = trades.filter(t => t.profitLoss > 0).reduce((sum, t) => sum + t.profitLoss, 0) || 0;
+                    const grossLoss = trades.filter(t => t.profitLoss < 0).reduce((sum, t) => sum + t.profitLoss, 0) || 0;
+                    const profitFactor = grossLoss !== 0 ? Math.abs(grossProfit / grossLoss).toFixed(2) : 0;
+                    const response = { totalTrades, winRate, netProfit, profitFactor };
+                    console.log('Backtest response:', response);
+                    res.json(response);
+                } else if (endpoint === 'paper-trade') {
+                    console.log('Handling /api/paper-trade');
+                    const { broker, apiKey, accountId } = req.body || {};
+                    const trades = await executeICTStrategy('MES1', false, null, true);
+                    paperTradeLog.push(...trades);
+                    const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
+                    res.json({ status: 'Paper Trading Active', netProfit });
+                } else if (endpoint === 'paper-backtest') {
+                    console.log('Handling /api/paper-backtest');
+                    const { broker, apiKey, accountId } = req.body || {};
+                    const trades = await executeICTStrategy('MES1', true, '2024-10-01', true);
+                    paperTradeLog.push(...trades);
+                    const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
+                    res.json({ status: 'Paper Backtest Complete', netProfit });
+                } else {
+                    console.log(`Unknown POST endpoint: ${endpoint}`);
+                    res.status(404).json({ error: 'Not found' });
                 }
-                if (!isEvaluation && (accountBalance < peakBalance - maxDrawdown)) {
-                    res.json({ status: 'Trading Stopped: Drawdown Limit Hit', profit: dailyProfit, wins: 0, losses: 0 });
-                    return;
+            } else if (req.method === 'GET') {
+                if (endpoint === 'trade-log') {
+                    console.log('Handling /api/trade-log');
+                    res.json(tradeLog);
+                } else if (endpoint === 'backtest-trade-log') {
+                    console.log('Handling /api/backtest-trade-log');
+                    res.json(backtestTradeLog);
+                } else if (endpoint === 'paper-trade-log') {
+                    console.log('Handling /api/paper-trade-log');
+                    res.json(paperTradeLog);
+                } else if (endpoint === 'market-data') {
+                    console.log('Handling /api/market-data');
+                    const data = await fetchMarketData();
+                    res.json(data);
+                } else {
+                    console.log(`Unknown GET endpoint: ${endpoint}`);
+                    res.status(404).json({ error: 'Not found' });
                 }
-                res.json({
-                    status: dailyProfit >= profitTarget || dailyLoss >= maxDrawdown ? 'Trading Stopped' : 'Trading Active',
-                    profit: dailyProfit,
-                    wins: tradeLog.filter(t => t.profitLoss > 0).length,
-                    losses: tradeLog.filter(t => t.profitLoss < 0).length
-                });
-            } else if (req.url === '/api/backtest') {
-                const { instrument, strategy, date } = req.body || {};
-                console.log('Backtest request body:', { instrument, strategy, date });
-                if (!instrument || !strategy || !date) {
-                    res.status(400).json({ error: 'Missing required fields: instrument, strategy, or date' });
-                    return;
-                }
-                backtestTradeLog = []; // Reset backtest log
-                const trades = await executeICTStrategy(instrument, true, date);
-                backtestTradeLog.push(...trades);
-                const totalTrades = trades.length;
-                const wins = trades.filter(t => t.profitLoss > 0).length;
-                const winRate = totalTrades > 0 ? (wins / totalTrades * 100).toFixed(2) : 0;
-                const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-                const grossProfit = trades.filter(t => t.profitLoss > 0).reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-                const grossLoss = trades.filter(t => t.profitLoss < 0).reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-                const profitFactor = grossLoss !== 0 ? Math.abs(grossProfit / grossLoss).toFixed(2) : 0;
-                const response = { totalTrades, winRate, netProfit, profitFactor };
-                console.log('Backtest response:', response);
-                res.json(response);
-            } else if (req.url === '/api/paper-trade') {
-                const { broker, apiKey, accountId } = req.body || {};
-                const trades = await executeICTStrategy('MES1', false, null, true);
-                paperTradeLog.push(...trades);
-                const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-                res.json({ status: 'Paper Trading Active', netProfit });
-            } else if (req.url === '/api/paper-backtest') {
-                const { broker, apiKey, accountId } = req.body || {};
-                const trades = await executeICTStrategy('MES1', true, '2024-10-01', true);
-                paperTradeLog.push(...trades);
-                const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-                res.json({ status: 'Paper Backtest Complete', netProfit });
             } else {
-                res.status(404).json({ error: 'Not found' });
-            }
-        } else if (req.method === 'GET') {
-            if (req.url === '/api/trade-log') {
-                res.json(tradeLog);
-            } else if (req.url === '/api/backtest-trade-log') {
-                res.json(backtestTradeLog);
-            } else if (req.url === '/api/paper-trade-log') {
-                res.json(paperTradeLog);
-            } else if (req.url === '/api/market-data') {
-                const data = await fetchMarketData();
-                res.json(data);
-            } else {
-                res.status(404).json({ error: 'Not found' });
+                console.log(`Unsupported method: ${req.method} for endpoint: ${endpoint}`);
+                res.status(405).json({ error: 'Method not allowed' });
             }
         } else {
-            res.status(405).json({ error: 'Method not allowed' });
+            console.log('Request does not start with /api/');
+            res.status(404).json({ error: 'Not found' });
         }
     } catch (error) {
         console.error('Serverless function error:', error);
