@@ -1,18 +1,14 @@
 {
-    "name": "trading-bot-backend",
+    "name": "futures-ai-trading-backend",
     "version": "1.0.0",
-    "main": "index.js",
-    "scripts": {
-        "start": "node index.js"
-    },
+    "description": "Backend for Futures AI Trading",
     "dependencies": {
-        "express": "^4.18.2",
-        "axios": "^1.6.8",
-        "dotenv": "^16.4.5",
-        "technicalindicators": "^3.1.0",
-        "cors": "^2.8.5"
+        "axios": "^1.6.0",
+        "ml-js": "^6.0.0"
     },
-    "engines": {
-        "node": "18.x"
+    "vercel": {
+        "routes": [
+            { "src": "/api/(.*)", "dest": "/api/index.js" }
+        ]
     }
 }
