@@ -1,8 +1,7 @@
 const axios = require('axios');
-const cors = require('cors');
-const { ML } = require('ml-js');
+const { SimpleLinearRegression } = require('ml-regression');
 
-// Polygon API key (replace with your key)
+// Polygon API key
 const POLYGON_API_KEY = 'Pq2TNELGWQpjDQh8EByJmfNIhtFu6AP4';
 let tradeLog = [];
 let paperTradeLog = [];
@@ -17,113 +16,110 @@ let isEvaluation = true; // Toggle between evaluation and post-evaluation
 const contracts = 20; // 20 MES contracts
 
 // AI model for learning
-let model = new ML.Regression.SimpleLinearRegression();
+let model = new SimpleLinearRegression();
 let trainingData = { inputs: [], outputs: [] };
 
-// CORS configuration
-const corsOptions = {
-    origin: '*', // Allow all origins (you can restrict to 'https://futureaitrading.netlify.app' if needed)
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    optionsSuccessStatus: 200
-};
-
-// Apply CORS middleware
-const corsMiddleware = cors(corsOptions);
-
 module.exports = async (req, res) => {
-    // Apply CORS middleware
-    corsMiddleware(req, res, async () => {
-        console.log(`Received ${req.method} request to ${req.url}`);
+    // Set CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-        if (req.method === 'POST') {
-            if (req.url === '/api/start-trading') {
-                try {
-                    const trades = await executeICTStrategy('MES1');
-                    tradeLog.push(...trades);
-                    updateAccountStats(trades);
-                    if (isEvaluation && dailyProfit >= profitTarget) {
-                        isEvaluation = false; // Pass evaluation
-                    }
-                    if (!isEvaluation && (accountBalance < peakBalance - maxDrawdown)) {
-                        res.json({ status: 'Trading Stopped: Drawdown Limit Hit', profit: dailyProfit, wins: 0, losses: 0 });
-                        return;
-                    }
-                    res.json({
-                        status: dailyProfit >= profitTarget || dailyLoss >= maxDrawdown ? 'Trading Stopped' : 'Trading Active',
-                        profit: dailyProfit,
-                        wins: tradeLog.filter(t => t.profitLoss > 0).length,
-                        losses: tradeLog.filter(t => t.profitLoss < 0).length
-                    });
-                } catch (error) {
-                    console.error('Error in start-trading:', error);
-                    res.status(500).json({ error: 'Internal server error', details: error.message });
+    if (req.method === 'OPTIONS') {
+        console.log('Handling OPTIONS request');
+        res.status(200).end();
+        return;
+    }
+
+    console.log(`Received ${req.method} request to ${req.url}`);
+
+    if (req.method === 'POST') {
+        if (req.url === '/api/start-trading') {
+            try {
+                const trades = await executeICTStrategy('MES1');
+                tradeLog.push(...trades);
+                updateAccountStats(trades);
+                if (isEvaluation && dailyProfit >= profitTarget) {
+                    isEvaluation = false; // Pass evaluation
                 }
-            } else if (req.url === '/api/backtest') {
-                try {
-                    const { instrument, strategy, date } = req.body;
-                    console.log('Backtest request body:', { instrument, strategy, date });
-                    if (!instrument || !strategy || !date) {
-                        res.status(400).json({ error: 'Missing required fields: instrument, strategy, or date' });
-                        return;
-                    }
-                    backtestTradeLog = []; // Reset backtest log
-                    const trades = await executeICTStrategy(instrument, true, date);
-                    backtestTradeLog.push(...trades);
-                    const totalTrades = trades.length;
-                    const wins = trades.filter(t => t.profitLoss > 0).length;
-                    const winRate = totalTrades > 0 ? (wins / totalTrades * 100).toFixed(2) : 0;
-                    const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-                    const grossProfit = trades.filter(t => t.profitLoss > 0).reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-                    const grossLoss = trades.filter(t => t.profitLoss < 0).reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-                    const profitFactor = grossLoss !== 0 ? Math.abs(grossProfit / grossLoss).toFixed(2) : 0;
-                    const response = { totalTrades, winRate, netProfit, profitFactor };
-                    console.log('Backtest response:', response);
-                    res.json(response);
-                } catch (error) {
-                    console.error('Error in backtest:', error);
-                    res.status(500).json({ error: 'Internal server error', details: error.message });
+                if (!isEvaluation && (accountBalance < peakBalance - maxDrawdown)) {
+                    res.json({ status: 'Trading Stopped: Drawdown Limit Hit', profit: dailyProfit, wins: 0, losses: 0 });
+                    return;
                 }
-            } else if (req.url === '/api/paper-trade') {
-                try {
-                    const { broker, apiKey, accountId } = req.body;
-                    const trades = await executeICTStrategy('MES1', false, null, true);
-                    paperTradeLog.push(...trades);
-                    const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-                    res.json({ status: 'Paper Trading Active', netProfit });
-                } catch (error) {
-                    console.error('Error in paper-trade:', error);
-                    res.status(500).json({ error: 'Internal server error', details: error.message });
-                }
-            } else if (req.url === '/api/paper-backtest') {
-                try {
-                    const { broker, apiKey, accountId } = req.body;
-                    const trades = await executeICTStrategy('MES1', true, '2024-10-01', true);
-                    paperTradeLog.push(...trades);
-                    const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-                    res.json({ status: 'Paper Backtest Complete', netProfit });
-                } catch (error) {
-                    console.error('Error in paper-backtest:', error);
-                    res.status(500).json({ error: 'Internal server error', details: error.message });
-                }
+                res.json({
+                    status: dailyProfit >= profitTarget || dailyLoss >= maxDrawdown ? 'Trading Stopped' : 'Trading Active',
+                    profit: dailyProfit,
+                    wins: tradeLog.filter(t => t.profitLoss > 0).length,
+                    losses: tradeLog.filter(t => t.profitLoss < 0).length
+                });
+            } catch (error) {
+                console.error('Error in start-trading:', error);
+                res.status(500).json({ error: 'Internal server error', details: error.message });
             }
-        } else if (req.method === 'GET') {
-            if (req.url === '/api/trade-log') {
-                res.json(tradeLog);
-            } else if (req.url === '/api/backtest-trade-log') {
-                res.json(backtestTradeLog);
-            } else if (req.url === '/api/paper-trade-log') {
-                res.json(paperTradeLog);
-            } else if (req.url === '/api/market-data') {
-                const data = await fetchMarketData();
-                res.json(data);
-            } else {
-                res.status(404).json({ error: 'Not found' });
+        } else if (req.url === '/api/backtest') {
+            try {
+                const { instrument, strategy, date } = req.body;
+                console.log('Backtest request body:', { instrument, strategy, date });
+                if (!instrument || !strategy || !date) {
+                    res.status(400).json({ error: 'Missing required fields: instrument, strategy, or date' });
+                    return;
+                }
+                backtestTradeLog = []; // Reset backtest log
+                const trades = await executeICTStrategy(instrument, true, date);
+                backtestTradeLog.push(...trades);
+                const totalTrades = trades.length;
+                const wins = trades.filter(t => t.profitLoss > 0).length;
+                const winRate = totalTrades > 0 ? (wins / totalTrades * 100).toFixed(2) : 0;
+                const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
+                const grossProfit = trades.filter(t => t.profitLoss > 0).reduce((sum, t) => sum + t.profitLoss, 0) || 0;
+                const grossLoss = trades.filter(t => t.profitLoss < 0).reduce((sum, t) => sum + t.profitLoss, 0) || 0;
+                const profitFactor = grossLoss !== 0 ? Math.abs(grossProfit / grossLoss).toFixed(2) : 0;
+                const response = { totalTrades, winRate, netProfit, profitFactor };
+                console.log('Backtest response:', response);
+                res.json(response);
+            } catch (error) {
+                console.error('Error in backtest:', error);
+                res.status(500).json({ error: 'Internal server error', details: error.message });
             }
-        } else {
-            res.status(405).json({ error: 'Method not allowed' });
+        } else if (req.url === '/api/paper-trade') {
+            try {
+                const { broker, apiKey, accountId } = req.body;
+                const trades = await executeICTStrategy('MES1', false, null, true);
+                paperTradeLog.push(...trades);
+                const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
+                res.json({ status: 'Paper Trading Active', netProfit });
+            } catch (error) {
+                console.error('Error in paper-trade:', error);
+                res.status(500).json({ error: 'Internal server error', details: error.message });
+            }
+        } else if (req.url === '/api/paper-backtest') {
+            try {
+                const { broker, apiKey, accountId } = req.body;
+                const trades = await executeICTStrategy('MES1', true, '2024-10-01', true);
+                paperTradeLog.push(...trades);
+                const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
+                res.json({ status: 'Paper Backtest Complete', netProfit });
+            } catch (error) {
+                console.error('Error in paper-backtest:', error);
+                res.status(500).json({ error: 'Internal server error', details: error.message });
+            }
         }
-    });
+    } else if (req.method === 'GET') {
+        if (req.url === '/api/trade-log') {
+            res.json(tradeLog);
+        } else if (req.url === '/api/backtest-trade-log') {
+            res.json(backtestTradeLog);
+        } else if (req.url === '/api/paper-trade-log') {
+            res.json(paperTradeLog);
+        } else if (req.url === '/api/market-data') {
+            const data = await fetchMarketData();
+            res.json(data);
+        } else {
+            res.status(404).json({ error: 'Not found' });
+        }
+    } else {
+        res.status(405).json({ error: 'Method not allowed' });
+    }
 };
 
 async function fetchMarketData() {
