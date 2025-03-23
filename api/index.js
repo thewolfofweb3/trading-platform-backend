@@ -42,14 +42,14 @@ module.exports = async (req, res) => {
 
     try {
         // Normalize the URL by removing query parameters and trailing slashes
-        const urlPath = req.url.split('?')[0].replace(/\/+$/, '');
+        const urlPath = req.url.split('?')[0].replace(/\/+$/, '').toLowerCase();
         console.log(`Normalized URL path: ${urlPath}`);
 
-        // Simplified route matching
+        // Route matching
         if (urlPath === '/api/market-data' && req.method === 'GET') {
             console.log('Handling /api/market-data');
             const data = await fetchMarketData();
-            res.json(data);
+            res.status(200).json(data);
         } else if (urlPath === '/api/backtest' && req.method === 'POST') {
             console.log('Handling /api/backtest');
             const { instrument, strategy, date } = req.body || {};
@@ -67,10 +67,10 @@ module.exports = async (req, res) => {
             const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
             const grossProfit = trades.filter(t => t.profitLoss > 0).reduce((sum, t) => sum + t.profitLoss, 0) || 0;
             const grossLoss = trades.filter(t => t.profitLoss < 0).reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-            const profitFactor = grossLoss !== 0 ? Math.abs(grossProfit / grossLoss).toFixed(2) : 0;
+            const profitFactor = grossLoss !== 0 ? Math.abs(grossProfit / grossLoss).toFixed(2) : 'Infinity';
             const response = { totalTrades, winRate, netProfit, profitFactor };
             console.log('Backtest response:', response);
-            res.json(response);
+            res.status(200).json(response);
         } else if (urlPath === '/api/start-trading' && req.method === 'POST') {
             console.log('Handling /api/start-trading');
             const trades = await executeICTStrategy('MES1');
@@ -80,10 +80,10 @@ module.exports = async (req, res) => {
                 isEvaluation = false; // Pass evaluation
             }
             if (!isEvaluation && (accountBalance < peakBalance - maxDrawdown)) {
-                res.json({ status: 'Trading Stopped: Drawdown Limit Hit', profit: dailyProfit, wins: 0, losses: 0 });
+                res.status(200).json({ status: 'Trading Stopped: Drawdown Limit Hit', profit: dailyProfit, wins: 0, losses: 0 });
                 return;
             }
-            res.json({
+            res.status(200).json({
                 status: dailyProfit >= profitTarget || dailyLoss >= maxDrawdown ? 'Trading Stopped' : 'Trading Active',
                 profit: dailyProfit,
                 wins: tradeLog.filter(t => t.profitLoss > 0).length,
@@ -95,23 +95,23 @@ module.exports = async (req, res) => {
             const trades = await executeICTStrategy('MES1', false, null, true);
             paperTradeLog.push(...trades);
             const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-            res.json({ status: 'Paper Trading Active', netProfit });
+            res.status(200).json({ status: 'Paper Trading Active', netProfit });
         } else if (urlPath === '/api/paper-backtest' && req.method === 'POST') {
             console.log('Handling /api/paper-backtest');
             const { broker, apiKey, accountId } = req.body || {};
             const trades = await executeICTStrategy('MES1', true, '2024-10-01', true);
             paperTradeLog.push(...trades);
             const netProfit = trades.reduce((sum, t) => sum + t.profitLoss, 0) || 0;
-            res.json({ status: 'Paper Backtest Complete', netProfit });
+            res.status(200).json({ status: 'Paper Backtest Complete', netProfit });
         } else if (urlPath === '/api/trade-log' && req.method === 'GET') {
             console.log('Handling /api/trade-log');
-            res.json(tradeLog);
+            res.status(200).json(tradeLog);
         } else if (urlPath === '/api/backtest-trade-log' && req.method === 'GET') {
             console.log('Handling /api/backtest-trade-log');
-            res.json(backtestTradeLog);
+            res.status(200).json(backtestTradeLog);
         } else if (urlPath === '/api/paper-trade-log' && req.method === 'GET') {
             console.log('Handling /api/paper-trade-log');
-            res.json(paperTradeLog);
+            res.status(200).json(paperTradeLog);
         } else {
             console.log(`No matching route for ${req.method} ${urlPath}`);
             res.status(404).json({ error: 'Not found' });
