@@ -15,3 +15,4 @@
 ## Notes
 - Replace `YOUR_POLYGON_API_KEY` in `api/index.js` with your Polygon API key.
 - Ensure the `vercel.json` file is included to handle CORS headers.
+- The `cors` package is used to handle CORS requests reliably.
